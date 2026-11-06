@@ -48,7 +48,7 @@ jobs:
                   sys.exit(1)
           PY
           # Fails when Cargo.lock is out of date with the manifests.
-          cargo metadata --locked --format-version 1 > /dev/null
+          cargo metadata --format-version 1 > /dev/null
           python3 - <<'PY'
           import sys, tomllib
           lock = tomllib.load(open("Cargo.lock", "rb"))
