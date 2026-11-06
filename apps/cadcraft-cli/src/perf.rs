@@ -73,6 +73,45 @@ fn synthetic(n: usize, side: f64) -> Result<cadcraft_engine::doc::Drawing, cadcr
     Ok(dr)
 }
 
+/// Deterministic hatch heavy drawing for the one-entity edit journey when no suitable DWG is
+/// present in the pinned corpus. The entity count and regular pattern make its cost reproducible.
+fn synthetic_hatched(n: usize) -> Result<cadcraft_engine::doc::Drawing, cadcraft_engine::doc::DocError> {
+    use cadcraft_engine::doc::{self as d, Common, EntityKind, Hatch, HatchLoop, Space};
+    use cadcraft_engine::geom::{PolyVertex, Vec2};
+    let mut drawing = d::Drawing::new_imperial();
+    let side = (n as f64).sqrt().ceil();
+    for i in 0..n {
+        let (x, y) = ((i as f64 % side) * 12.0, (i as f64 / side).floor() * 12.0);
+        let loop_vertices = |radius: f64, count: usize| {
+            (0..count)
+                .map(|point| {
+                    let angle = std::f64::consts::TAU * point as f64 / count as f64;
+                    PolyVertex { p: Vec2::new(x + radius * angle.cos(), y + radius * angle.sin()), bulge: 0.0, start_width: 0.0, end_width: 0.0 }
+                })
+                .collect()
+        };
+        let hatch = Hatch {
+            pattern: "ANSI31".into(),
+            solid: false,
+            loops: vec![
+                HatchLoop { vertices: loop_vertices(5.0, 256), outer: true, sources: Vec::new() },
+                HatchLoop { vertices: loop_vertices(1.4, 128), outer: false, sources: Vec::new() },
+            ],
+            scale: 8.0,
+            angle: 0.0,
+            associative: false,
+            style: 0,
+            elevation: 0.0,
+            gradient: None,
+            origin: Vec2::ZERO,
+            background: None,
+            pattern_lines: Vec::new(),
+        };
+        drawing.add(&Space::Model, Common::default(), EntityKind::Hatch(hatch))?;
+    }
+    Ok(drawing)
+}
+
 /// `perf FILE`: the display list built as the canvas builds it (a 1600 x 1000 px view at the
 /// drawing's centre: tolerance, dash level of detail and view window from the zoom band), at
 /// zoom extents and zoomed in 4x at a time, next to the full-detail build plots use.
@@ -107,6 +146,39 @@ fn perf_file(path: &std::path::Path, io: &mut Streams) -> Result {
         io.outln(format_args!("{:>7}x {:>10.1} {n:>10}", zoom, ms(t)));
         finest = screen;
     }
+    // A representative single-entity property edit: warm per-entity tessellations once, clone
+    // the copy-on-write drawing, change one object, and compare its incremental display list to
+    // the canonical full rebuild. The timing excludes file open and initial cache population.
+    if let Some(handle) = d.space(space).and_then(|s| s.iter().last()).map(|e| e.handle) {
+        let mut cache = cadcraft_engine::render::EntityDisplayCache::default();
+        let _ = cadcraft_engine::render::build_cached(d, space, &finest, &mut cache);
+        let mut edited = d.as_ref().clone();
+        if let Some(store) = edited.space_mut(space) {
+            store.modify(handle, |entity| {
+                entity.common.visible = !entity.common.visible;
+            });
+        }
+        let t = Instant::now();
+        let incremental = cadcraft_engine::render::build_cached(&edited, space, &finest, &mut cache);
+        let incremental_ms = ms(t);
+        let t = Instant::now();
+        let full = build(&edited, space, &finest);
+        let full_ms = ms(t);
+        let identical = incremental.prims == full.prims
+            && incremental.verts == full.verts
+            && incremental.tris == full.tris
+            && incremental.images == full.images
+            && incremental.prim_layers == full.prim_layers
+            && incremental.texts == full.texts
+            && incremental.pens == full.pens
+            && incremental.bounds == full.bounds
+            && incremental.expanded == full.expanded
+            && incremental.truncated == full.truncated;
+        io.outln(format_args!(
+            "entity edit display list: full {full_ms:.2} ms, incremental {incremental_ms:.2} ms, outputs {}",
+            if identical { "identical" } else { "DIFFERENT" }
+        ));
+    }
     // Plots: every pattern line, everywhere (last, so its large list doesn't weigh on the above).
     let t = Instant::now();
     let n = build(d, space, &Options { min_dash: 0.0, view: None, ..finest }).prims.len();
@@ -129,12 +201,63 @@ pub(crate) fn perf(target: Option<&PerfTarget>, io: &mut Streams) -> Result {
     let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
 
     let t = Instant::now();
-    let d = synthetic(n, side)?;
-    rows.push(("build synthetic drawing".into(), ms(t), format!("{n} entities")));
+    let hatched = std::env::var_os("CADCRAFT_PERF_HATCHED").is_some();
+    let d = if hatched { synthetic_hatched(n)? } else { synthetic(n, side)? };
+    rows.push((if hatched { "build synthetic hatched drawing" } else { "build synthetic drawing" }.into(), ms(t), format!("{n} entities")));
 
     // Display list at a 1600 px wide "zoom extents" view (tolerance = half a pixel).
     let px = side / 1600.0;
     let opts = cadcraft_engine::render::Options { tolerance: px * 0.5, min_dash: px * 2.0, ..Default::default() };
+    if hatched {
+        use std::hash::{Hash, Hasher};
+        let mut cache = cadcraft_engine::render::EntityDisplayCache::default();
+        let _ = cadcraft_engine::render::build_cached(&d, &Space::Model, &opts, &mut cache);
+        let mut edited = d.clone();
+        if let Some(handle) = edited.model.iter().last().map(|e| e.handle) {
+            let _ = edited.model.modify(handle, |e| {
+                if let cadcraft_engine::doc::EntityKind::Hatch(hatch) = &mut e.kind {
+                    hatch.scale *= 1.1;
+                }
+            });
+            let incremental_mode = std::env::var("CADCRAFT_PERF_HATCHED_MODE").as_deref() == Ok("incremental");
+            let t = Instant::now();
+            let measured = if incremental_mode {
+                cadcraft_engine::render::build_cached(&edited, &Space::Model, &opts, &mut cache)
+            } else {
+                cadcraft_engine::render::build(&edited, &Space::Model, &opts)
+            };
+            let measured_ms = ms(t);
+            let reference = if incremental_mode {
+                cadcraft_engine::render::build(&edited, &Space::Model, &opts)
+            } else {
+                cadcraft_engine::render::build_cached(&edited, &Space::Model, &opts, &mut cache)
+            };
+            let identical = measured.prims == reference.prims
+                && measured.verts == reference.verts
+                && measured.tris == reference.tris
+                && measured.images == reference.images
+                && measured.prim_layers == reference.prim_layers
+                && measured.texts == reference.texts
+                && measured.pens == reference.pens
+                && measured.bounds == reference.bounds
+                && measured.expanded == reference.expanded
+                && measured.truncated == reference.truncated;
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            format!("{:?}", measured.prims).hash(&mut hash);
+            for p in measured.verts.iter().chain(&measured.tris) {
+                p.x.to_bits().hash(&mut hash);
+                p.y.to_bits().hash(&mut hash);
+            }
+            io.outln(format_args!(
+                "entity edit {} {:.3} ms; identical={identical}",
+                if incremental_mode { "incremental" } else { "full" },
+                measured_ms
+            ));
+            io.outln(format_args!("CRAFT_JOURNEY_NS={}", (measured_ms * 1_000_000.0) as u64));
+            io.outln(format_args!("CRAFT_OUTPUT_HASH={:016x}", hash.finish()));
+        }
+        return Ok(());
+    }
     let t = Instant::now();
     let list = cadcraft_engine::render::build(&d, &Space::Model, &opts);
     rows.push(("display list build".into(), ms(t), format!("{} prims, {} segments", list.prims.len(), list.segment_count())));

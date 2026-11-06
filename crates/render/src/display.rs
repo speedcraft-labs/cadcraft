@@ -179,7 +179,6 @@ impl DisplayList {
 }
 
 /// Append `src` to `dst`: its primitives index into `dst`'s vertex and triangle arrays.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn append(dst: &mut DisplayList, src: DisplayList) {
     let (verts, tris, prims) = (dst.verts.len() as u32, dst.tris.len() as u32, dst.prims.len() as u32);
     let images = dst.images.len() as u32;
@@ -205,6 +204,35 @@ pub(crate) fn append(dst: &mut DisplayList, src: DisplayList) {
         t
     }));
     dst.pens.extend(src.pens);
+    dst.bounds = dst.bounds.union(&src.bounds);
+    dst.expanded = dst.expanded.saturating_add(src.expanded);
+}
+
+/// Append a cached fragment without cloning its backing vectors first.
+pub(crate) fn append_ref(dst: &mut DisplayList, src: &DisplayList) {
+    let (verts, tris, prims) = (dst.verts.len() as u32, dst.tris.len() as u32, dst.prims.len() as u32);
+    let images = dst.images.len() as u32;
+    if !src.pens.is_empty() {
+        dst.pens.resize(dst.prims.len(), Pen::default());
+    }
+    dst.prims.extend(src.prims.iter().copied().map(|mut p| {
+        p.start += if matches!(p.kind, Kind::Tris | Kind::Mask) { tris } else { verts };
+        if let Kind::Image { index } = &mut p.kind {
+            *index = index.saturating_add(images);
+        }
+        p
+    }));
+    dst.images.extend(src.images.iter().cloned());
+    dst.verts.extend_from_slice(&src.verts);
+    dst.tris.extend_from_slice(&src.tris);
+    dst.prim_layers.extend_from_slice(&src.prim_layers);
+    dst.texts.extend(src.texts.iter().cloned().map(|mut t| {
+        if t.prim < PlotText::CLIPPED {
+            t.prim += prims;
+        }
+        t
+    }));
+    dst.pens.extend_from_slice(&src.pens);
     dst.bounds = dst.bounds.union(&src.bounds);
     dst.expanded = dst.expanded.saturating_add(src.expanded);
 }

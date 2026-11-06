@@ -4,6 +4,110 @@ use super::display::{DisplayList, Kind, NO_LAYER, PlotText, VIEWPORT_CONTENT};
 use super::draw::entity;
 use super::viewports::{MAX_VIEWPORTS, viewport};
 use super::{Bounds2, Builder, Color, Ctx, Drawing, Entity, EntityKind, Handle, Lineweight, Mat3, Space, Vec2, paper, pen, plotstyle, point};
+use std::collections::{HashMap, HashSet};
+
+/// Reusable per-entity tessellations for interactive model-space edits.
+///
+/// Entries are keyed by handle and the address of the immutable entity `Arc`, so a copy-on-write
+/// edit invalidates only the touched entity. The flattened list is still assembled in draw order;
+/// geometry generation (especially hatch tessellation) is skipped for every unchanged entity.
+#[derive(Default)]
+pub struct EntityDisplayCache {
+    options: Option<Vec<u64>>,
+    fragments: HashMap<Handle, (std::sync::Arc<Entity>, DisplayList)>,
+}
+
+impl EntityDisplayCache {
+    pub fn clear(&mut self) {
+        self.options = None;
+        self.fragments.clear();
+    }
+}
+
+/// Build a model-space display list while reusing tessellation for unchanged entities.
+/// Unsupported constructs use the regular pipeline, which preserves its shared expansion budget.
+pub fn build_cached(d: &Drawing, space: &Space, opts: &Options, cache: &mut EntityDisplayCache) -> DisplayList {
+    use std::hash::{Hash, Hasher};
+    use std::sync::Arc;
+
+    let normalized_opts = with_point_view(d, space, opts);
+    let opts = &normalized_opts;
+    let mut style_hash = std::collections::hash_map::DefaultHasher::new();
+    format!("{:?}", (&d.header, &d.layers, &d.linetypes, &d.text_styles, &d.hidden_objects)).hash(&mut style_hash);
+    let options = [
+        opts.tolerance.to_bits(),
+        opts.min_dash.to_bits(),
+        u64::from(opts.text),
+        u64::from(opts.linetypes),
+        u64::from(opts.fill),
+        u64::from(opts.lineweights),
+        opts.view_height.to_bits(),
+        opts.view.map_or(0, |v| v.min.x.to_bits()),
+        opts.view.map_or(0, |v| v.min.y.to_bits()),
+        opts.view.map_or(0, |v| v.max.x.to_bits()),
+        opts.view.map_or(0, |v| v.max.y.to_bits()),
+        u64::from(opts.transparency),
+        opts.skip_viewport.map_or(0, |h| h.0),
+        opts.plot_style_table.as_ref().map_or(0, |t| Arc::as_ptr(t) as usize as u64),
+        style_hash.finish(),
+    ];
+    let Some(store) = d.space(space) else {
+        cache.clear();
+        return DisplayList::default();
+    };
+    let cacheable = matches!(space, Space::Model)
+        && opts.plot_style_table.is_none()
+        && opts.cancel.is_none()
+        && store.iter().all(|e| {
+            !matches!(
+                e.kind,
+                EntityKind::Insert(_)
+                    | EntityKind::Dimension(_)
+                    | EntityKind::Leader(_)
+                    | EntityKind::MLeader(_)
+                    | EntityKind::Viewport(_)
+                    | EntityKind::Table(_)
+            )
+        });
+    if !cacheable {
+        cache.clear();
+        return build(d, space, opts);
+    }
+    if cache.options.as_deref() != Some(options.as_slice()) {
+        cache.fragments.clear();
+        cache.options = Some(options.to_vec());
+    }
+    let entities: Vec<_> = store.iter().collect();
+    let mut order = Vec::with_capacity(entities.len());
+    let stale: Vec<_> = entities
+        .iter()
+        .filter_map(|entity| {
+            let handle = entity.handle;
+            let needs_build = cache.fragments.get(&handle).is_none_or(|(old, _)| !Arc::ptr_eq(old, entity));
+            if needs_build { Some((*entity).clone()) } else { None }
+        })
+        .collect();
+    let refreshed: Vec<_> = {
+        use rayon::prelude::*;
+        stale.par_iter().map(|entity| (entity.handle, entity.clone(), build_entities(d, std::iter::once(entity.as_ref()), opts))).collect()
+    };
+    for (handle, entity, fragment) in refreshed {
+        cache.fragments.insert(handle, (entity, fragment));
+    }
+    for entity in entities {
+        let handle = entity.handle;
+        order.push(handle);
+    }
+    let live: HashSet<_> = order.iter().copied().collect();
+    cache.fragments.retain(|handle, _| live.contains(handle));
+    let mut out = DisplayList::default();
+    for handle in order {
+        if let Some((_, fragment)) = cache.fragments.get(&handle) {
+            super::display::append_ref(&mut out, fragment);
+        }
+    }
+    out
+}
 
 /// Build options.
 #[derive(Clone, Debug)]
