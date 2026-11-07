@@ -171,7 +171,11 @@ fn perf_file(path: &std::path::Path, io: &mut Streams) -> Result {
         let mut edited = d.as_ref().clone();
         if let Some(store) = edited.space_mut(space) {
             store.modify(handle, |entity| {
-                entity.common.visible = !entity.common.visible;
+                if let cadcraft_engine::doc::EntityKind::Hatch(hatch) = &mut entity.kind {
+                    hatch.scale *= 1.1;
+                } else {
+                    entity.common.visible = !entity.common.visible;
+                }
             });
         }
         let incremental_mode = std::env::var("CADCRAFT_PERF_EDIT_MODE").as_deref() == Ok("incremental");
