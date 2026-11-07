@@ -55,6 +55,31 @@ fn entity_cache_rebuilds_inserts_when_a_block_definition_changes() {
 }
 
 #[test]
+fn entity_cache_tracks_draw_order_changes_and_removals() {
+    let mut d = sample();
+    let first = d.model.iter().next().unwrap().handle;
+    let second = d.model.iter().nth(1).unwrap().handle;
+    let mut cache = EntityDisplayCache::default();
+
+    build_cached(&d, &Space::Model, &Options::default(), &mut cache);
+    assert!(d.model.bring_to_front(first));
+    let reordered = build_cached(&d, &Space::Model, &Options::default(), &mut cache);
+    let full = build(&d, &Space::Model, &Options::default());
+    assert_eq!(reordered.prims, full.prims);
+    assert_eq!(reordered.verts, full.verts);
+    assert_eq!(reordered.tris, full.tris);
+    assert_eq!(reordered.bounds, full.bounds);
+
+    assert!(d.model.remove(second).is_some());
+    let without_removed = build_cached(&d, &Space::Model, &Options::default(), &mut cache);
+    let full = build(&d, &Space::Model, &Options::default());
+    assert_eq!(without_removed.prims, full.prims);
+    assert_eq!(without_removed.verts, full.verts);
+    assert_eq!(without_removed.tris, full.tris);
+    assert_eq!(without_removed.bounds, full.bounds);
+}
+
+#[test]
 fn linetype_dashes_line() {
     let mut d = sample();
     d.linetypes.extend(cadcraft_doc::library::standard_linetypes());

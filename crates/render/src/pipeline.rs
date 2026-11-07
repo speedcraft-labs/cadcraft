@@ -15,6 +15,9 @@ use std::collections::{HashMap, HashSet};
 pub struct EntityDisplayCache {
     options: Option<Vec<u64>>,
     fragments: HashMap<Handle, (std::sync::Arc<Entity>, DisplayList)>,
+    order: Vec<Handle>,
+    expansion: usize,
+    truncated_fragments: usize,
     // Hold the definitions used to calculate the option key. Besides keeping pointer identities
     // stable, this makes any copy-on-write block edit invalidate fragments that expand a block.
     block_versions: Vec<std::sync::Arc<cadcraft_doc::Block>>,
@@ -27,6 +30,9 @@ impl EntityDisplayCache {
     pub fn clear(&mut self) {
         self.options = None;
         self.fragments.clear();
+        self.order.clear();
+        self.expansion = 0;
+        self.truncated_fragments = 0;
         self.block_versions.clear();
         self.rasters = None;
     }
@@ -72,23 +78,44 @@ pub fn build_cached(d: &Drawing, space: &Space, opts: &Options, cache: &mut Enti
         cache.clear();
         return DisplayList::default();
     };
-    let cacheable = matches!(space, Space::Model)
-        && opts.plot_style_table.is_none()
-        && opts.cancel.is_none()
-        && store.iter().all(|e| !matches!(e.kind, EntityKind::Viewport(_)));
+    let cacheable = matches!(space, Space::Model) && opts.plot_style_table.is_none() && opts.cancel.is_none();
     if !cacheable {
+        cache.clear();
+        return build(d, space, opts);
+    }
+    let entities: Vec<_> = store.iter().collect();
+    if entities.iter().any(|entity| matches!(entity.kind, EntityKind::Viewport(_))) {
         cache.clear();
         return build(d, space, opts);
     }
     let rasters_changed = cache.rasters.as_ref().is_some_and(|old| !old.shares_storage_with(&d.rasters));
     if cache.options.as_deref() != Some(options.as_slice()) || rasters_changed {
         cache.fragments.clear();
+        cache.order.clear();
+        cache.expansion = 0;
+        cache.truncated_fragments = 0;
         cache.options = Some(options.to_vec());
         cache.block_versions = d.blocks.values().cloned().collect();
         cache.rasters = Some(d.rasters.clone());
     }
-    let entities: Vec<_> = store.iter().collect();
-    let mut order = Vec::with_capacity(entities.len());
+    let order_matches = cache.order.len() == entities.len() && cache.order.iter().zip(&entities).all(|(handle, entity)| *handle == entity.handle);
+    if !order_matches {
+        if !cache.fragments.is_empty() {
+            let live: HashSet<_> = entities.iter().map(|entity| entity.handle).collect();
+            let old_len = cache.fragments.len();
+            cache.fragments.retain(|handle, _| live.contains(handle));
+            if cache.fragments.len() != old_len {
+                cache.expansion = 0;
+                cache.truncated_fragments = 0;
+                for (_, fragment) in cache.fragments.values() {
+                    cache.expansion = cache.expansion.saturating_add(fragment.expanded);
+                    increment_truncated(&mut cache.truncated_fragments, fragment);
+                }
+            }
+        }
+        cache.order.clear();
+        cache.order.extend(entities.iter().map(|entity| entity.handle));
+    }
     let stale: Vec<_> = entities
         .iter()
         .filter_map(|entity| {
@@ -102,38 +129,36 @@ pub fn build_cached(d: &Drawing, space: &Space, opts: &Options, cache: &mut Enti
         stale.par_iter().map(|entity| (entity.handle, entity.clone(), build_entities(d, std::iter::once(entity.as_ref()), opts))).collect()
     };
     for (handle, entity, fragment) in refreshed {
-        cache.fragments.insert(handle, (entity, fragment));
-    }
-    for entity in entities {
-        let handle = entity.handle;
-        order.push(handle);
-    }
-    let live: HashSet<_> = order.iter().copied().collect();
-    cache.fragments.retain(|handle, _| live.contains(handle));
-    let mut expansion = 0usize;
-    let mut needs_full_build = false;
-    for (_, fragment) in cache.fragments.values() {
-        if fragment.truncated {
-            needs_full_build = true;
-            break;
+        let new_expansion = fragment.expanded;
+        let new_truncated = fragment.truncated;
+        if let Some((_, previous)) = cache.fragments.insert(handle, (entity, fragment)) {
+            cache.expansion = cache.expansion.saturating_sub(previous.expanded);
+            if previous.truncated {
+                cache.truncated_fragments = cache.truncated_fragments.saturating_sub(1);
+            }
         }
-        expansion = expansion.saturating_add(fragment.expanded);
-        if expansion > super::MAX_BLOCK_EXPANSION {
-            needs_full_build = true;
-            break;
+        cache.expansion = cache.expansion.saturating_add(new_expansion);
+        if new_truncated {
+            cache.truncated_fragments = cache.truncated_fragments.saturating_add(1);
         }
     }
-    if needs_full_build {
+    if cache.truncated_fragments != 0 || cache.expansion > super::MAX_BLOCK_EXPANSION {
         cache.clear();
         return build(d, space, opts);
     }
     let mut out = DisplayList::default();
-    for handle in order {
-        if let Some((_, fragment)) = cache.fragments.get(&handle) {
+    for entity in entities {
+        if let Some((_, fragment)) = cache.fragments.get(&entity.handle) {
             super::display::append_ref(&mut out, fragment);
         }
     }
     out
+}
+
+fn increment_truncated(count: &mut usize, fragment: &DisplayList) {
+    if fragment.truncated {
+        *count = count.saturating_add(1);
+    }
 }
 
 /// Build options.
