@@ -217,7 +217,7 @@ fn populate_cache(
     if budgeted {
         let spent = std::sync::atomic::AtomicUsize::new(0);
         for entity in entities {
-            if !matches!(entity.kind, EntityKind::Insert(_)) {
+            if !matches!(entity.kind, EntityKind::Insert(_) | EntityKind::Dimension(_)) {
                 continue;
             }
             let Some((_, fragment)) = cache.fragments.get(&entity.handle) else { continue };
@@ -363,19 +363,42 @@ fn update_bounds(flat: &mut DisplayList, old: Bounds2, new: &DisplayList, fragme
 }
 
 fn block_expansion_upper_bound(d: &Drawing, store: &cadcraft_doc::EntityStore) -> usize {
-    let cap = super::MAX_BLOCK_EXPANSION.saturating_add(1);
+    block_expansion_upper_bound_capped(d, store, super::MAX_BLOCK_EXPANSION.saturating_add(1))
+}
+
+fn block_expansion_upper_bound_capped(d: &Drawing, store: &cadcraft_doc::EntityStore, cap: usize) -> usize {
     let mut total = 0usize;
     let mut memo: HashMap<(String, usize), usize> = HashMap::new();
     let mut active = std::collections::HashSet::new();
     for entity in store.iter() {
-        if let EntityKind::Insert(insert) = &entity.kind {
-            total = total.saturating_add(insert_expansion_upper_bound(d, insert, 0, cap, &mut memo, &mut active)).min(cap);
-            if total == cap {
-                return cap;
-            }
+        let nested = match &entity.kind {
+            EntityKind::Insert(insert) => insert_expansion_upper_bound(d, insert, 0, cap, &mut memo, &mut active),
+            EntityKind::Dimension(dimension) => dimension_block_expansion_upper_bound(d, dimension, 0, cap, &mut memo, &mut active),
+            _ => 0,
+        };
+        total = total.saturating_add(nested).min(cap);
+        if total == cap {
+            return cap;
         }
     }
     total
+}
+
+fn dimension_block_expansion_upper_bound(
+    d: &Drawing,
+    dimension: &cadcraft_doc::Dimension,
+    depth: usize,
+    cap: usize,
+    memo: &mut HashMap<(String, usize), usize>,
+    active: &mut std::collections::HashSet<(String, usize)>,
+) -> usize {
+    if depth >= cadcraft_doc::MAX_BLOCK_DEPTH {
+        return 0;
+    }
+    let Some(block) = dimension.block.as_deref() else {
+        return 0;
+    };
+    block_body_expansion_upper_bound(d, block, depth + 1, cap, memo, active)
 }
 
 fn insert_expansion_upper_bound(
@@ -420,6 +443,7 @@ fn block_body_expansion_upper_bound(
     for entity in block.entities.iter() {
         let nested = match &entity.kind {
             EntityKind::Insert(insert) => insert_expansion_upper_bound(d, insert, entity_depth, cap, memo, active),
+            EntityKind::Dimension(dimension) => dimension_block_expansion_upper_bound(d, dimension, entity_depth, cap, memo, active),
             _ => 0,
         };
         total = total.saturating_add(1).saturating_add(nested).min(cap);
@@ -695,5 +719,62 @@ fn take_viewport_layers(list: &mut DisplayList) {
         if let Some(p) = list.prims.get_mut(i) {
             p.handle = VIEWPORT_CONTENT;
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::block_expansion_upper_bound_capped;
+    use cadcraft_doc::{Block, Common, DimKind, Dimension, Drawing, Entity, EntityKind, EntityStore, Handle, Insert, Line};
+    use cadcraft_geom::Vec3;
+    use std::sync::Arc;
+
+    fn dimension(block: &str) -> Dimension {
+        Dimension {
+            kind: DimKind::Linear { rotation: 0.0 },
+            defpt: Vec3::ZERO,
+            text_mid: Vec3::ZERO,
+            p13: Vec3::ZERO,
+            p14: Vec3::ZERO,
+            p15: Vec3::ZERO,
+            p16: Vec3::ZERO,
+            text: String::new(),
+            style: "Standard".into(),
+            measurement: 0.0,
+            text_rotation: 0.0,
+            user_text_pos: false,
+            block: Some(block.into()),
+            insertion_point: Vec3::ZERO,
+            overrides: Default::default(),
+            assoc: Vec::new(),
+            marks: Default::default(),
+        }
+    }
+
+    #[test]
+    fn block_expansion_bound_includes_dimension_blocks_and_caps() {
+        let mut drawing = Drawing::new_imperial();
+        let mut inner = Block::new("Inner");
+        for i in 0..3 {
+            inner.entities.push(Entity::new(Handle(i + 1), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(1.0, 0.0, 0.0) })));
+        }
+        drawing.blocks.insert("Inner".into(), Arc::new(inner));
+
+        let mut outer = Block::new("Outer");
+        outer.entities.push(Entity::new(Handle(10), EntityKind::Dimension(dimension("Inner"))));
+        drawing.blocks.insert("Outer".into(), Arc::new(outer));
+
+        let mut store = EntityStore::new();
+        store.push(Entity { handle: Handle(100), common: Common::default(), kind: EntityKind::Dimension(dimension("Inner")) });
+        store.push(Entity {
+            handle: Handle(101),
+            common: Common::default(),
+            kind: EntityKind::Insert(Insert { block: "Outer".into(), ..Default::default() }),
+        });
+
+        // The top-level dimension expands three block entities. The insert charges itself,
+        // its dimension entity, and the three entities in that dimension's block.
+        assert_eq!(block_expansion_upper_bound_capped(&drawing, &store, 100), 8);
+        assert_eq!(block_expansion_upper_bound_capped(&drawing, &store, 7), 7);
     }
 }
