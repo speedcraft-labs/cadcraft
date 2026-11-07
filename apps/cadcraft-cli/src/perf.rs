@@ -9,6 +9,8 @@ use cadcraft_engine::Session;
 pub(crate) enum PerfError {
     #[error("perf: the drawing is empty")]
     EmptyDrawing,
+    #[error("perf: full and incremental display lists differ")]
+    OutputMismatch,
 }
 
 /// Small deterministic generator (xorshift64*) so perf runs are repeatable without a dependency.
@@ -134,6 +136,7 @@ fn perf_file(path: &std::path::Path, io: &mut Streams) -> Result {
     io.outln(format_args!("open {open_ms:.0} ms, {} entities, extents {:.1} x {:.1}", d.entity_count(), ext.width(), ext.height()));
     io.outln(format_args!("{:>8} {:>10} {:>10}", "zoom", "build ms", "prims"));
     let mut finest = Options::default();
+    let mut zoom_extents = Options::default();
     for k in 0..5 {
         let zoom = 4f64.powi(k);
         let h = size / zoom;
@@ -141,6 +144,9 @@ fn perf_file(path: &std::path::Path, io: &mut Streams) -> Result {
         let half = Vec2::new(h * 0.8, h * 0.5);
         let visible = Bounds2::new(ext.center() - half, ext.center() + half);
         let screen = Options { tolerance: pixel * 0.5, min_dash: pixel * 2.0, view: Some(visible.expand(h * 0.8)), ..Default::default() };
+        if k == 0 {
+            zoom_extents = screen.clone();
+        }
         let t = Instant::now();
         let n = build(d, space, &screen).prims.len();
         io.outln(format_args!("{:>7}x {:>10.1} {n:>10}", zoom, ms(t)));
@@ -149,21 +155,45 @@ fn perf_file(path: &std::path::Path, io: &mut Streams) -> Result {
     // A representative single-entity property edit: warm per-entity tessellations once, clone
     // the copy-on-write drawing, change one object, and compare its incremental display list to
     // the canonical full rebuild. The timing excludes file open and initial cache population.
-    if let Some(handle) = d.space(space).and_then(|s| s.iter().last()).map(|e| e.handle) {
+    // The real-file journey matches a fit-to-drawing view; the open-DXF probe keeps its zoomed-in
+    // diagnostic measurement.
+    let edit_opts = if std::env::var_os("CADCRAFT_PERF_EDIT_MODE").is_some() { &zoom_extents } else { &finest };
+    let edited_handle = d.space(space).and_then(|store| {
+        store
+            .iter()
+            .find(|entity| matches!(entity.kind, cadcraft_engine::doc::EntityKind::Hatch(_)))
+            .or_else(|| store.iter().last())
+            .map(|entity| entity.handle)
+    });
+    if let Some(handle) = edited_handle {
         let mut cache = cadcraft_engine::render::EntityDisplayCache::default();
-        let _ = cadcraft_engine::render::build_cached(d, space, &finest, &mut cache);
+        let _ = cadcraft_engine::render::build_cached(d, space, edit_opts, &mut cache);
         let mut edited = d.as_ref().clone();
         if let Some(store) = edited.space_mut(space) {
             store.modify(handle, |entity| {
                 entity.common.visible = !entity.common.visible;
             });
         }
-        let t = Instant::now();
-        let incremental = cadcraft_engine::render::build_cached(&edited, space, &finest, &mut cache);
-        let incremental_ms = ms(t);
-        let t = Instant::now();
-        let full = build(&edited, space, &finest);
-        let full_ms = ms(t);
+        let incremental_mode = std::env::var("CADCRAFT_PERF_EDIT_MODE").as_deref() == Ok("incremental");
+        let (full, full_duration, incremental, incremental_duration) = if incremental_mode {
+            let t = Instant::now();
+            let incremental = cadcraft_engine::render::build_cached(&edited, space, edit_opts, &mut cache);
+            let incremental_duration = t.elapsed();
+            let t = Instant::now();
+            let full = build(&edited, space, edit_opts);
+            let full_duration = t.elapsed();
+            (full, full_duration, incremental, incremental_duration)
+        } else {
+            let t = Instant::now();
+            let full = build(&edited, space, edit_opts);
+            let full_duration = t.elapsed();
+            let t = Instant::now();
+            let incremental = cadcraft_engine::render::build_cached(&edited, space, edit_opts, &mut cache);
+            let incremental_duration = t.elapsed();
+            (full, full_duration, incremental, incremental_duration)
+        };
+        let full_ms = full_duration.as_secs_f64() * 1000.0;
+        let incremental_ms = incremental_duration.as_secs_f64() * 1000.0;
         let identical = incremental.prims == full.prims
             && incremental.verts == full.verts
             && incremental.tris == full.tris
@@ -174,10 +204,21 @@ fn perf_file(path: &std::path::Path, io: &mut Streams) -> Result {
             && incremental.bounds == full.bounds
             && incremental.expanded == full.expanded
             && incremental.truncated == full.truncated;
-        io.outln(format_args!(
-            "entity edit display list: full {full_ms:.2} ms, incremental {incremental_ms:.2} ms, outputs {}",
-            if identical { "identical" } else { "DIFFERENT" }
-        ));
+        io.outln(format_args!("entity edit display list: full {full_ms:.2} ms, incremental {incremental_ms:.2} ms, outputs identical={identical}"));
+        if std::env::var_os("CADCRAFT_PERF_EDIT_MODE").is_some() {
+            let (duration, output) = if incremental_mode { (incremental_duration, &incremental) } else { (full_duration, &full) };
+            let digest = format!("{output:?}");
+            let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+            for byte in digest.bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            io.outln(format_args!("CRAFT_JOURNEY_NS={}", duration.as_nanos()));
+            io.outln(format_args!("CRAFT_OUTPUT_HASH={hash:016x}"));
+            if !identical {
+                return Err(PerfError::OutputMismatch.into());
+            }
+        }
     }
     // Plots: every pattern line, everywhere (last, so its large list doesn't weigh on the above).
     let t = Instant::now();
