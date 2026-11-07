@@ -15,17 +15,26 @@ use std::collections::{HashMap, HashSet};
 pub struct EntityDisplayCache {
     options: Option<Vec<u64>>,
     fragments: HashMap<Handle, (std::sync::Arc<Entity>, DisplayList)>,
+    // Hold the definitions used to calculate the option key. Besides keeping pointer identities
+    // stable, this makes any copy-on-write block edit invalidate fragments that expand a block.
+    block_versions: Vec<std::sync::Arc<cadcraft_doc::Block>>,
+    // Raster images can load after the first list build without changing an entity. Retain the
+    // immutable map so a COW image load invalidates cached IMAGE fragments too.
+    rasters: Option<cadcraft_doc::Rasters>,
 }
 
 impl EntityDisplayCache {
     pub fn clear(&mut self) {
         self.options = None;
         self.fragments.clear();
+        self.block_versions.clear();
+        self.rasters = None;
     }
 }
 
 /// Build a model-space display list while reusing tessellation for unchanged entities.
-/// Unsupported constructs use the regular pipeline, which preserves its shared expansion budget.
+/// A changed block definition invalidates the cache, and the result falls back to the regular
+/// pipeline if splitting the build would exceed the shared block-expansion budget.
 pub fn build_cached(d: &Drawing, space: &Space, opts: &Options, cache: &mut EntityDisplayCache) -> DisplayList {
     use std::hash::{Hash, Hasher};
     use std::sync::Arc;
@@ -33,7 +42,15 @@ pub fn build_cached(d: &Drawing, space: &Space, opts: &Options, cache: &mut Enti
     let normalized_opts = with_point_view(d, space, opts);
     let opts = &normalized_opts;
     let mut style_hash = std::collections::hash_map::DefaultHasher::new();
-    format!("{:?}", (&d.header, &d.layers, &d.linetypes, &d.text_styles, &d.hidden_objects)).hash(&mut style_hash);
+    format!(
+        "{:?}",
+        (&d.header, &d.layers, &d.linetypes, &d.text_styles, &d.dim_styles, &d.mleader_styles, &d.table_styles, &d.mline_styles, &d.hidden_objects,)
+    )
+    .hash(&mut style_hash);
+    for (name, block) in &d.blocks {
+        name.hash(&mut style_hash);
+        (Arc::as_ptr(block) as usize).hash(&mut style_hash);
+    }
     let options = [
         opts.tolerance.to_bits(),
         opts.min_dash.to_bits(),
@@ -58,24 +75,17 @@ pub fn build_cached(d: &Drawing, space: &Space, opts: &Options, cache: &mut Enti
     let cacheable = matches!(space, Space::Model)
         && opts.plot_style_table.is_none()
         && opts.cancel.is_none()
-        && store.iter().all(|e| {
-            !matches!(
-                e.kind,
-                EntityKind::Insert(_)
-                    | EntityKind::Dimension(_)
-                    | EntityKind::Leader(_)
-                    | EntityKind::MLeader(_)
-                    | EntityKind::Viewport(_)
-                    | EntityKind::Table(_)
-            )
-        });
+        && store.iter().all(|e| !matches!(e.kind, EntityKind::Viewport(_)));
     if !cacheable {
         cache.clear();
         return build(d, space, opts);
     }
-    if cache.options.as_deref() != Some(options.as_slice()) {
+    let rasters_changed = cache.rasters.as_ref().is_some_and(|old| !old.shares_storage_with(&d.rasters));
+    if cache.options.as_deref() != Some(options.as_slice()) || rasters_changed {
         cache.fragments.clear();
         cache.options = Some(options.to_vec());
+        cache.block_versions = d.blocks.values().cloned().collect();
+        cache.rasters = Some(d.rasters.clone());
     }
     let entities: Vec<_> = store.iter().collect();
     let mut order = Vec::with_capacity(entities.len());
@@ -100,6 +110,23 @@ pub fn build_cached(d: &Drawing, space: &Space, opts: &Options, cache: &mut Enti
     }
     let live: HashSet<_> = order.iter().copied().collect();
     cache.fragments.retain(|handle, _| live.contains(handle));
+    let mut expansion = 0usize;
+    let mut needs_full_build = false;
+    for (_, fragment) in cache.fragments.values() {
+        if fragment.truncated {
+            needs_full_build = true;
+            break;
+        }
+        expansion = expansion.saturating_add(fragment.expanded);
+        if expansion > super::MAX_BLOCK_EXPANSION {
+            needs_full_build = true;
+            break;
+        }
+    }
+    if needs_full_build {
+        cache.clear();
+        return build(d, space, opts);
+    }
     let mut out = DisplayList::default();
     for handle in order {
         if let Some((_, fragment)) = cache.fragments.get(&handle) {

@@ -61,6 +61,12 @@ impl std::fmt::Debug for Raster {
 pub struct Rasters(Arc<BTreeMap<String, Arc<Raster>>>);
 
 impl Rasters {
+    /// Whether both values reference the same immutable path-to-raster map.
+    #[must_use]
+    pub fn shares_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn get(&self, path: &str) -> Option<&Arc<Raster>> {
         self.0.get(path)
     }

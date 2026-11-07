@@ -7,7 +7,7 @@ use cadcraft_color::Rgb;
 use cadcraft_doc::{Block, Common, Drawing, Entity, EntityKind, Handle, Image, Insert, Line, Raster, Space, Transparency, Viewport};
 use cadcraft_geom::{Vec2, Vec3};
 use cadcraft_render::raster::{RasterOptions, View, render};
-use cadcraft_render::{Kind, Options, build};
+use cadcraft_render::{EntityDisplayCache, Kind, Options, build, build_cached};
 
 const RED: [u8; 4] = [255, 0, 0, 255];
 const GREEN: [u8; 4] = [0, 255, 0, 255];
@@ -82,6 +82,22 @@ fn an_image_without_pixels_is_a_crossed_out_frame() {
         assert!(list.images.is_empty());
         assert_eq!(list.prims.iter().filter(|p| p.kind == Kind::Polyline).count(), 3, "frame and two diagonals");
     }
+}
+
+#[test]
+fn cached_image_fragments_refresh_when_raster_pixels_load() {
+    let mut d = drawing(image(), false);
+    let mut cache = EntityDisplayCache::default();
+    let initial = build_cached(&d, &Space::Model, &Options::default(), &mut cache);
+    assert!(initial.images.is_empty());
+
+    d.rasters.insert("map.png", pixels());
+    let cached = build_cached(&d, &Space::Model, &Options::default(), &mut cache);
+    let full = build(&d, &Space::Model, &Options::default());
+    assert_eq!(cached.prims, full.prims);
+    assert_eq!(cached.verts, full.verts);
+    assert_eq!(cached.images, full.images);
+    assert_eq!(cached.images.len(), 1);
 }
 
 #[test]

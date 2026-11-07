@@ -26,6 +26,35 @@ fn builds_lines_and_circles() {
 }
 
 #[test]
+fn entity_cache_rebuilds_inserts_when_a_block_definition_changes() {
+    let mut d = Drawing::new_imperial();
+    let mut block = cadcraft_doc::Block::new("CacheBlock");
+    block.entities.push(cadcraft_doc::Entity::new(
+        cadcraft_doc::Handle(90_000),
+        EntityKind::Line(cadcraft_doc::Line { a: Vec3::ZERO, b: Vec3::new(10.0, 0.0, 0.0) }),
+    ));
+    d.blocks.insert("CacheBlock".into(), std::sync::Arc::new(block));
+    let handle = d.add(&Space::Model, Common::default(), insert_of("CacheBlock")).unwrap();
+
+    let mut cache = EntityDisplayCache::default();
+    let initial = build_cached(&d, &Space::Model, &Options::default(), &mut cache);
+    assert_eq!(initial.prims, build(&d, &Space::Model, &Options::default()).prims);
+
+    let mut edited = d.clone();
+    if let Some(block) = edited.blocks.get_mut("CacheBlock") {
+        std::sync::Arc::make_mut(block).entities.modify(cadcraft_doc::Handle(90_000), |entity| entity.common.visible = false);
+    }
+    let incremental = build_cached(&edited, &Space::Model, &Options::default(), &mut cache);
+    let full = build(&edited, &Space::Model, &Options::default());
+    assert_eq!(incremental.prims, full.prims);
+    assert_eq!(incremental.verts, full.verts);
+    assert_eq!(incremental.tris, full.tris);
+    assert_eq!(incremental.bounds, full.bounds);
+    assert!(incremental.prims.is_empty());
+    assert!(edited.model.contains(handle));
+}
+
+#[test]
 fn linetype_dashes_line() {
     let mut d = sample();
     d.linetypes.extend(cadcraft_doc::library::standard_linetypes());
