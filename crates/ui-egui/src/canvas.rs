@@ -100,7 +100,7 @@ fn same_content(a: &ListKey, b: &ListKey) -> bool {
 
 #[derive(Default)]
 pub struct CanvasState {
-    pub list: Option<DisplayList>,
+    pub list: Option<std::sync::Arc<DisplayList>>,
     /// Tessellated model-space fragments reused across copy-on-write entity edits.
     pub(crate) entity_display_cache: cadcraft_render::EntityDisplayCache,
     /// The font set the list was drawn with ([`cadcraft_fonts::ttf::generation`] and
@@ -235,7 +235,7 @@ impl CanvasState {
             self.mesh_ms = m.ms;
             self.infinite = m.infinite;
         }
-        self.list = Some(built.list);
+        self.list = Some(std::sync::Arc::new(built.list));
         self.key = key;
         self.window = window;
         self.build_ms = built.build_ms;

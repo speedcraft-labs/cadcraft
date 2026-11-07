@@ -80,6 +80,48 @@ fn entity_cache_tracks_draw_order_changes_and_removals() {
 }
 
 #[test]
+fn entity_cache_patches_same_shape_edits_in_the_existing_flat_list() {
+    use std::sync::Arc;
+
+    let drawing = sample();
+    let handle = drawing.model.iter().next().unwrap().handle;
+    let mut cache = EntityDisplayCache::default();
+    let initial = build_cached(&drawing, &Space::Model, &Options::default(), &mut cache);
+    let allocation = Arc::as_ptr(&initial);
+    drop(initial);
+
+    let mut edited = drawing.clone();
+    edited.model.modify(handle, |entity| entity.common.color = Color::Index(2));
+    let incremental = build_cached(&edited, &Space::Model, &Options::default(), &mut cache);
+    let full = build(&edited, &Space::Model, &Options::default());
+
+    assert_eq!(Arc::as_ptr(&incremental), allocation);
+    assert_eq!(incremental.prims, full.prims);
+    assert_eq!(incremental.verts, full.verts);
+    assert_eq!(incremental.tris, full.tris);
+    assert_eq!(incremental.images, full.images);
+    assert_eq!(incremental.prim_layers, full.prim_layers);
+    assert_eq!(incremental.texts, full.texts);
+    assert_eq!(incremental.pens, full.pens);
+    assert_eq!(incremental.bounds, full.bounds);
+    assert_eq!(incremental.expanded, full.expanded);
+    assert_eq!(incremental.truncated, full.truncated);
+}
+
+#[test]
+fn appended_display_fragments_keep_the_truncation_flag() {
+    let mut owned = crate::display::DisplayList::default();
+    let mut source = crate::display::DisplayList::default();
+    source.truncated = true;
+    crate::display::append(&mut owned, source.clone());
+    assert!(owned.truncated);
+
+    let mut cached = crate::display::DisplayList::default();
+    crate::display::append_ref(&mut cached, &source);
+    assert!(cached.truncated);
+}
+
+#[test]
 fn linetype_dashes_line() {
     let mut d = sample();
     d.linetypes.extend(cadcraft_doc::library::standard_linetypes());

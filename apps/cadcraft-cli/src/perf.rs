@@ -4,6 +4,22 @@ use super::open;
 use super::output::Streams;
 use cadcraft_engine::Session;
 
+fn output_hash(value: &impl std::fmt::Debug) -> u64 {
+    struct Fnv(u64);
+    impl std::fmt::Write for Fnv {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            for byte in value.bytes() {
+                self.0 ^= u64::from(byte);
+                self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            Ok(())
+        }
+    }
+    let mut hash = Fnv(0xcbf2_9ce4_8422_2325);
+    let _ = std::fmt::write(&mut hash, format_args!("{value:?}"));
+    hash.0
+}
+
 /// Why `perf` cannot run.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PerfError {
@@ -134,100 +150,119 @@ fn perf_file(path: &std::path::Path, io: &mut Streams) -> Result {
         return Err(PerfError::EmptyDrawing.into());
     }
     io.outln(format_args!("open {open_ms:.0} ms, {} entities, extents {:.1} x {:.1}", d.entity_count(), ext.width(), ext.height()));
+    let edit_mode = std::env::var("CADCRAFT_PERF_EDIT_MODE").ok();
     io.outln(format_args!("{:>8} {:>10} {:>10}", "zoom", "build ms", "prims"));
     let mut finest = Options::default();
     let mut zoom_extents = Options::default();
-    for k in 0..5 {
-        let zoom = 4f64.powi(k);
-        let h = size / zoom;
+    if edit_mode.is_some() {
+        let h = size;
         let pixel = 2f64.powi((h / 1000.0).max(1e-300).log2().floor() as i32);
         let half = Vec2::new(h * 0.8, h * 0.5);
         let visible = Bounds2::new(ext.center() - half, ext.center() + half);
-        let screen = Options { tolerance: pixel * 0.5, min_dash: pixel * 2.0, view: Some(visible.expand(h * 0.8)), ..Default::default() };
-        if k == 0 {
-            zoom_extents = screen.clone();
+        zoom_extents = Options { tolerance: pixel * 0.5, min_dash: pixel * 2.0, view: Some(visible.expand(h * 0.8)), ..Default::default() };
+        finest = zoom_extents.clone();
+    } else {
+        for k in 0..5 {
+            let zoom = 4f64.powi(k);
+            let h = size / zoom;
+            let pixel = 2f64.powi((h / 1000.0).max(1e-300).log2().floor() as i32);
+            let half = Vec2::new(h * 0.8, h * 0.5);
+            let visible = Bounds2::new(ext.center() - half, ext.center() + half);
+            let screen = Options { tolerance: pixel * 0.5, min_dash: pixel * 2.0, view: Some(visible.expand(h * 0.8)), ..Default::default() };
+            if k == 0 {
+                zoom_extents = screen.clone();
+            }
+            let t = Instant::now();
+            let n = build(d, space, &screen).prims.len();
+            io.outln(format_args!("{:>7}x {:>10.1} {n:>10}", zoom, ms(t)));
+            finest = screen;
         }
-        let t = Instant::now();
-        let n = build(d, space, &screen).prims.len();
-        io.outln(format_args!("{:>7}x {:>10.1} {n:>10}", zoom, ms(t)));
-        finest = screen;
     }
-    // A representative single-entity property edit: warm per-entity tessellations once, clone
-    // the copy-on-write drawing, change one object, and compare its incremental display list to
-    // the canonical full rebuild. The timing excludes file open and initial cache population.
+    // A representative single-entity property edit in a fit-to-drawing view. Journey mode skips
+    // the unrelated zoom sweep and plot build so only the requested edit contributes work.
+    // The timing excludes file open and initial cache population.
     // The real-file journey matches a fit-to-drawing view; the open-DXF probe keeps its zoomed-in
     // diagnostic measurement.
-    let edit_opts = if std::env::var_os("CADCRAFT_PERF_EDIT_MODE").is_some() { &zoom_extents } else { &finest };
+    let edit_opts = if edit_mode.is_some() { &zoom_extents } else { &finest };
     let edited_handle = d.space(space).and_then(|store| {
         store
             .iter()
-            .find(|entity| matches!(entity.kind, cadcraft_engine::doc::EntityKind::Hatch(_)))
+            .find(|entity| matches!(entity.kind, cadcraft_engine::doc::EntityKind::Line(_)) && entity.common.visible)
+            .or_else(|| store.iter().find(|entity| matches!(entity.kind, cadcraft_engine::doc::EntityKind::Hatch(_))))
             .or_else(|| store.iter().last())
             .map(|entity| entity.handle)
     });
     if let Some(handle) = edited_handle {
+        let incremental_mode = edit_mode.as_deref() == Some("incremental");
+        let full_mode = edit_mode.as_deref() == Some("full");
         let mut cache = cadcraft_engine::render::EntityDisplayCache::default();
-        let _ = cadcraft_engine::render::build_cached(d, space, edit_opts, &mut cache);
+        if incremental_mode || !full_mode {
+            let _ = cadcraft_engine::render::build_cached(d, space, edit_opts, &mut cache);
+        }
         let mut edited = d.as_ref().clone();
         if let Some(store) = edited.space_mut(space) {
             store.modify(handle, |entity| {
                 if let cadcraft_engine::doc::EntityKind::Hatch(hatch) = &mut entity.kind {
                     hatch.scale *= 1.1;
                 } else {
-                    entity.common.visible = !entity.common.visible;
+                    let color = entity.common.color;
+                    entity.common.color = match color {
+                        cadcraft_engine::doc::color::Color::Index(1) => cadcraft_engine::doc::color::Color::Index(2),
+                        _ => cadcraft_engine::doc::color::Color::Index(1),
+                    };
                 }
             });
         }
-        let incremental_mode = std::env::var("CADCRAFT_PERF_EDIT_MODE").as_deref() == Ok("incremental");
-        let (full, full_duration, incremental, incremental_duration) = if incremental_mode {
+        if incremental_mode {
             let t = Instant::now();
             let incremental = cadcraft_engine::render::build_cached(&edited, space, edit_opts, &mut cache);
             let incremental_duration = t.elapsed();
             let t = Instant::now();
             let full = build(&edited, space, edit_opts);
             let full_duration = t.elapsed();
-            (full, full_duration, incremental, incremental_duration)
-        } else {
-            let t = Instant::now();
-            let full = build(&edited, space, edit_opts);
-            let full_duration = t.elapsed();
-            let t = Instant::now();
-            let incremental = cadcraft_engine::render::build_cached(&edited, space, edit_opts, &mut cache);
-            let incremental_duration = t.elapsed();
-            (full, full_duration, incremental, incremental_duration)
-        };
-        let full_ms = full_duration.as_secs_f64() * 1000.0;
-        let incremental_ms = incremental_duration.as_secs_f64() * 1000.0;
-        let identical = incremental.prims == full.prims
-            && incremental.verts == full.verts
-            && incremental.tris == full.tris
-            && incremental.images == full.images
-            && incremental.prim_layers == full.prim_layers
-            && incremental.texts == full.texts
-            && incremental.pens == full.pens
-            && incremental.bounds == full.bounds
-            && incremental.expanded == full.expanded
-            && incremental.truncated == full.truncated;
-        io.outln(format_args!("entity edit display list: full {full_ms:.2} ms, incremental {incremental_ms:.2} ms, outputs identical={identical}"));
-        if std::env::var_os("CADCRAFT_PERF_EDIT_MODE").is_some() {
-            let (duration, output) = if incremental_mode { (incremental_duration, &incremental) } else { (full_duration, &full) };
-            let digest = format!("{output:?}");
-            let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-            for byte in digest.bytes() {
-                hash ^= u64::from(byte);
-                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-            io.outln(format_args!("CRAFT_JOURNEY_NS={}", duration.as_nanos()));
+            let full_ms = full_duration.as_secs_f64() * 1000.0;
+            let incremental_ms = incremental_duration.as_secs_f64() * 1000.0;
+            let identical = incremental.prims == full.prims
+                && incremental.verts == full.verts
+                && incremental.tris == full.tris
+                && incremental.images == full.images
+                && incremental.prim_layers == full.prim_layers
+                && incremental.texts == full.texts
+                && incremental.pens == full.pens
+                && incremental.bounds == full.bounds
+                && incremental.expanded == full.expanded
+                && incremental.truncated == full.truncated;
+            io.outln(format_args!(
+                "entity edit display list: full {full_ms:.2} ms, incremental {incremental_ms:.2} ms, outputs identical={identical}"
+            ));
+            let hash = output_hash(&incremental);
+            io.outln(format_args!("CRAFT_JOURNEY_NS={}", incremental_duration.as_nanos()));
             io.outln(format_args!("CRAFT_OUTPUT_HASH={hash:016x}"));
             if !identical {
                 return Err(PerfError::OutputMismatch.into());
             }
+        } else if full_mode {
+            let t = Instant::now();
+            let full = build(&edited, space, edit_opts);
+            let full_duration = t.elapsed();
+            let full_ms = full_duration.as_secs_f64() * 1000.0;
+            io.outln(format_args!("entity edit display list: full {full_ms:.2} ms, incremental not run, outputs identical=canonical"));
+            let hash = output_hash(&full);
+            io.outln(format_args!("CRAFT_JOURNEY_NS={}", full_duration.as_nanos()));
+            io.outln(format_args!("CRAFT_OUTPUT_HASH={hash:016x}"));
+        } else {
+            let t = Instant::now();
+            let _incremental = cadcraft_engine::render::build_cached(&edited, space, edit_opts, &mut cache);
+            let incremental_ms = ms(t);
+            io.outln(format_args!("entity edit display list: incremental {incremental_ms:.2} ms"));
         }
     }
-    // Plots: every pattern line, everywhere (last, so its large list doesn't weigh on the above).
-    let t = Instant::now();
-    let n = build(d, space, &Options { min_dash: 0.0, view: None, ..finest }).prims.len();
-    io.outln(format_args!("{:>8} {:>10.1} {n:>10}", "full", ms(t)));
+    if edit_mode.is_none() {
+        // Plots: every pattern line, everywhere (last, so its large list doesn't weigh on above).
+        let t = Instant::now();
+        let n = build(d, space, &Options { min_dash: 0.0, view: None, ..finest }).prims.len();
+        io.outln(format_args!("{:>8} {:>10.1} {n:>10}", "full", ms(t)));
+    }
     Ok(())
 }
 
@@ -269,11 +304,11 @@ pub(crate) fn perf(target: Option<&PerfTarget>, io: &mut Streams) -> Result {
             let measured = if incremental_mode {
                 cadcraft_engine::render::build_cached(&edited, &Space::Model, &opts, &mut cache)
             } else {
-                cadcraft_engine::render::build(&edited, &Space::Model, &opts)
+                std::sync::Arc::new(cadcraft_engine::render::build(&edited, &Space::Model, &opts))
             };
             let measured_ms = ms(t);
             let reference = if incremental_mode {
-                cadcraft_engine::render::build(&edited, &Space::Model, &opts)
+                std::sync::Arc::new(cadcraft_engine::render::build(&edited, &Space::Model, &opts))
             } else {
                 cadcraft_engine::render::build_cached(&edited, &Space::Model, &opts, &mut cache)
             };

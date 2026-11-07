@@ -4,7 +4,66 @@ use super::display::{DisplayList, Kind, NO_LAYER, PlotText, VIEWPORT_CONTENT};
 use super::draw::entity;
 use super::viewports::{MAX_VIEWPORTS, viewport};
 use super::{Bounds2, Builder, Color, Ctx, Drawing, Entity, EntityKind, Handle, Lineweight, Mat3, Space, Vec2, paper, pen, plotstyle, point};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FragmentRange {
+    prims: (usize, usize),
+    verts: (usize, usize),
+    tris: (usize, usize),
+    images: (usize, usize),
+    prim_layers: (usize, usize),
+    texts: (usize, usize),
+    pens: (usize, usize),
+}
+
+impl FragmentRange {
+    fn at(list: &DisplayList) -> Self {
+        Self {
+            prims: (list.prims.len(), 0),
+            verts: (list.verts.len(), 0),
+            tris: (list.tris.len(), 0),
+            images: (list.images.len(), 0),
+            prim_layers: (list.prim_layers.len(), 0),
+            texts: (list.texts.len(), 0),
+            pens: (list.pens.len(), 0),
+        }
+    }
+
+    fn finish(mut self, end: &DisplayList) -> Self {
+        self.prims.1 = end.prims.len() - self.prims.0;
+        self.verts.1 = end.verts.len() - self.verts.0;
+        self.tris.1 = end.tris.len() - self.tris.0;
+        self.images.1 = end.images.len() - self.images.0;
+        self.prim_layers.1 = end.prim_layers.len() - self.prim_layers.0;
+        self.texts.1 = end.texts.len() - self.texts.0;
+        self.pens.1 = end.pens.len() - self.pens.0;
+        self
+    }
+
+    fn for_fragment(start: Self, fragment: &DisplayList) -> Self {
+        Self {
+            prims: (start.prims.0, fragment.prims.len()),
+            verts: (start.verts.0, fragment.verts.len()),
+            tris: (start.tris.0, fragment.tris.len()),
+            images: (start.images.0, fragment.images.len()),
+            prim_layers: (start.prim_layers.0, fragment.prim_layers.len()),
+            texts: (start.texts.0, fragment.texts.len()),
+            pens: (start.pens.0, fragment.pens.len()),
+        }
+    }
+
+    fn same_shape(self, other: Self) -> bool {
+        self.prims.1 == other.prims.1
+            && self.verts.1 == other.verts.1
+            && self.tris.1 == other.tris.1
+            && self.images.1 == other.images.1
+            && self.prim_layers.1 == other.prim_layers.1
+            && self.texts.1 == other.texts.1
+            && self.pens.1 == other.pens.1
+    }
+}
 
 /// Reusable per-entity tessellations for interactive model-space edits.
 ///
@@ -14,10 +73,16 @@ use std::collections::{HashMap, HashSet};
 #[derive(Default)]
 pub struct EntityDisplayCache {
     options: Option<Vec<u64>>,
-    fragments: HashMap<Handle, (std::sync::Arc<Entity>, DisplayList)>,
+    fragments: HashMap<Handle, (Arc<Entity>, DisplayList)>,
+    ranges: HashMap<Handle, FragmentRange>,
     order: Vec<Handle>,
+    positions: HashMap<Handle, usize>,
+    prefix_expansions: Vec<usize>,
+    store_snapshot: Option<cadcraft_doc::EntityStore>,
+    flat: Option<Arc<DisplayList>>,
     expansion: usize,
     truncated_fragments: usize,
+    budgeted: bool,
     // Hold the definitions used to calculate the option key. Besides keeping pointer identities
     // stable, this makes any copy-on-write block edit invalidate fragments that expand a block.
     block_versions: Vec<std::sync::Arc<cadcraft_doc::Block>>,
@@ -30,20 +95,26 @@ impl EntityDisplayCache {
     pub fn clear(&mut self) {
         self.options = None;
         self.fragments.clear();
+        self.ranges.clear();
         self.order.clear();
+        self.positions.clear();
+        self.prefix_expansions.clear();
+        self.store_snapshot = None;
+        self.flat = None;
         self.expansion = 0;
         self.truncated_fragments = 0;
+        self.budgeted = false;
         self.block_versions.clear();
         self.rasters = None;
     }
 }
 
 /// Build a model-space display list while reusing tessellation for unchanged entities.
-/// A changed block definition invalidates the cache, and the result falls back to the regular
-/// pipeline if splitting the build would exceed the shared block-expansion budget.
-pub fn build_cached(d: &Drawing, space: &Space, opts: &Options, cache: &mut EntityDisplayCache) -> DisplayList {
+/// A changed block definition invalidates the cache. Edits patch the cached flat list in place
+/// when fragment sizes stay stable, and ordered block-budget allocation keeps over-budget files
+/// deterministic.
+pub fn build_cached(d: &Drawing, space: &Space, opts: &Options, cache: &mut EntityDisplayCache) -> Arc<DisplayList> {
     use std::hash::{Hash, Hasher};
-    use std::sync::Arc;
 
     let normalized_opts = with_point_view(d, space, opts);
     let opts = &normalized_opts;
@@ -76,89 +147,289 @@ pub fn build_cached(d: &Drawing, space: &Space, opts: &Options, cache: &mut Enti
     ];
     let Some(store) = d.space(space) else {
         cache.clear();
-        return DisplayList::default();
+        return Arc::new(DisplayList::default());
     };
     let cacheable = matches!(space, Space::Model) && opts.plot_style_table.is_none() && opts.cancel.is_none();
     if !cacheable {
         cache.clear();
-        return build(d, space, opts);
-    }
-    let entities: Vec<_> = store.iter().collect();
-    if entities.iter().any(|entity| matches!(entity.kind, EntityKind::Viewport(_))) {
-        cache.clear();
-        return build(d, space, opts);
+        return Arc::new(build(d, space, opts));
     }
     let rasters_changed = cache.rasters.as_ref().is_some_and(|old| !old.shares_storage_with(&d.rasters));
-    if cache.options.as_deref() != Some(options.as_slice()) || rasters_changed {
-        cache.fragments.clear();
-        cache.order.clear();
-        cache.expansion = 0;
-        cache.truncated_fragments = 0;
+    let options_changed = cache.options.as_deref() != Some(options.as_slice()) || rasters_changed;
+    if options_changed {
+        cache.clear();
         cache.options = Some(options.to_vec());
         cache.block_versions = d.blocks.values().cloned().collect();
         cache.rasters = Some(d.rasters.clone());
     }
-    let order_matches = cache.order.len() == entities.len() && cache.order.iter().zip(&entities).all(|(handle, entity)| *handle == entity.handle);
-    if !order_matches {
-        if !cache.fragments.is_empty() {
-            let live: HashSet<_> = entities.iter().map(|entity| entity.handle).collect();
-            let old_len = cache.fragments.len();
-            cache.fragments.retain(|handle, _| live.contains(handle));
-            if cache.fragments.len() != old_len {
-                cache.expansion = 0;
-                cache.truncated_fragments = 0;
-                for (_, fragment) in cache.fragments.values() {
-                    cache.expansion = cache.expansion.saturating_add(fragment.expanded);
-                    increment_truncated(&mut cache.truncated_fragments, fragment);
-                }
-            }
+
+    let changes = if options_changed { None } else { cache.store_snapshot.as_ref().and_then(|old| store.changed_entities(old)) };
+    if let Some(changed) = changes.as_ref() {
+        if changed.iter().any(|entity| matches!(entity.kind, EntityKind::Viewport(_))) {
+            cache.clear();
+            return Arc::new(build(d, space, opts));
         }
-        cache.order.clear();
-        cache.order.extend(entities.iter().map(|entity| entity.handle));
+        if !changed.is_empty() {
+            if cache.flat.is_some() && apply_cached_changes(d, opts, cache, changed) {
+                cache.store_snapshot = Some(store.clone());
+                return cache.flat.as_ref().map(Arc::clone).unwrap_or_else(|| Arc::new(build(d, space, opts)));
+            }
+        } else if let Some(flat) = cache.flat.as_ref() {
+            cache.store_snapshot = Some(store.clone());
+            return Arc::clone(flat);
+        }
     }
-    let stale: Vec<_> = entities
-        .iter()
-        .filter_map(|entity| {
-            let handle = entity.handle;
-            let needs_build = cache.fragments.get(&handle).is_none_or(|(old, _)| !Arc::ptr_eq(old, entity));
-            if needs_build { Some((*entity).clone()) } else { None }
-        })
-        .collect();
-    let refreshed: Vec<_> = {
-        use rayon::prelude::*;
-        stale.par_iter().map(|entity| (entity.handle, entity.clone(), build_entities(d, std::iter::once(entity.as_ref()), opts))).collect()
-    };
-    for (handle, entity, fragment) in refreshed {
-        let new_expansion = fragment.expanded;
-        let new_truncated = fragment.truncated;
-        if let Some((_, previous)) = cache.fragments.insert(handle, (entity, fragment)) {
-            cache.expansion = cache.expansion.saturating_sub(previous.expanded);
-            if previous.truncated {
-                cache.truncated_fragments = cache.truncated_fragments.saturating_sub(1);
+
+    let entities: Vec<_> = store.iter().cloned().collect();
+    if entities.iter().any(|entity| matches!(entity.kind, EntityKind::Viewport(_))) {
+        cache.clear();
+        return Arc::new(build(d, space, opts));
+    }
+    let budgeted = block_expansion_upper_bound(d, store) > super::MAX_BLOCK_EXPANSION;
+    populate_cache(d, store, opts, cache, options, &entities, budgeted)
+}
+
+fn populate_cache(
+    d: &Drawing,
+    store: &cadcraft_doc::EntityStore,
+    opts: &Options,
+    cache: &mut EntityDisplayCache,
+    options: [u64; 15],
+    entities: &[Arc<Entity>],
+    budgeted: bool,
+) -> Arc<DisplayList> {
+    cache.fragments.clear();
+    cache.ranges.clear();
+    cache.order.clear();
+    cache.positions.clear();
+    cache.prefix_expansions.clear();
+    cache.expansion = 0;
+    cache.truncated_fragments = 0;
+    cache.budgeted = budgeted;
+    cache.options = Some(options.to_vec());
+    cache.block_versions = d.blocks.values().cloned().collect();
+    cache.rasters = Some(d.rasters.clone());
+
+    use rayon::prelude::*;
+    let fragments: Vec<_> =
+        entities.par_iter().map(|entity| (entity.handle, entity.clone(), build_entities(d, std::iter::once(entity.as_ref()), opts))).collect();
+    cache.fragments.extend(fragments.into_iter().map(|(handle, entity, fragment)| (handle, (entity, fragment))));
+    if budgeted {
+        let spent = std::sync::atomic::AtomicUsize::new(0);
+        for entity in entities {
+            if !matches!(entity.kind, EntityKind::Insert(_)) {
+                continue;
+            }
+            let Some((_, fragment)) = cache.fragments.get(&entity.handle) else { continue };
+            let expansions = fragment.expanded;
+            let needs_ordered_budget =
+                fragment.truncated || spent.load(std::sync::atomic::Ordering::Relaxed).saturating_add(expansions) > super::MAX_BLOCK_EXPANSION;
+            if needs_ordered_budget {
+                let fragment = build_entity_with_budget(d, entity, opts, &spent);
+                cache.fragments.insert(entity.handle, (entity.clone(), fragment));
+            } else {
+                spent.fetch_add(expansions, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        cache.expansion = cache.expansion.saturating_add(new_expansion);
-        if new_truncated {
+    }
+
+    let mut flat = DisplayList::default();
+    for (index, entity) in entities.iter().enumerate() {
+        let Some((_, fragment)) = cache.fragments.get(&entity.handle) else { continue };
+        cache.positions.insert(entity.handle, index);
+        cache.order.push(entity.handle);
+        cache.prefix_expansions.push(cache.expansion);
+        let before = FragmentRange::at(&flat);
+        super::display::append_ref(&mut flat, fragment);
+        cache.ranges.insert(entity.handle, before.finish(&flat));
+        cache.expansion = cache.expansion.saturating_add(fragment.expanded);
+        if fragment.truncated {
             cache.truncated_fragments = cache.truncated_fragments.saturating_add(1);
         }
     }
-    if cache.truncated_fragments != 0 || cache.expansion > super::MAX_BLOCK_EXPANSION {
-        cache.clear();
-        return build(d, space, opts);
-    }
-    let mut out = DisplayList::default();
-    for entity in entities {
-        if let Some((_, fragment)) = cache.fragments.get(&entity.handle) {
-            super::display::append_ref(&mut out, fragment);
-        }
-    }
-    out
+    cache.store_snapshot = Some(store.clone());
+    cache.flat = Some(Arc::new(flat));
+    cache.flat.as_ref().map(Arc::clone).unwrap_or_else(|| Arc::new(DisplayList::default()))
 }
 
-fn increment_truncated(count: &mut usize, fragment: &DisplayList) {
-    if fragment.truncated {
-        *count = count.saturating_add(1);
+fn apply_cached_changes(d: &Drawing, opts: &Options, cache: &mut EntityDisplayCache, changed: &[Arc<Entity>]) -> bool {
+    let mut updates = Vec::with_capacity(changed.len());
+    for entity in changed {
+        let Some(&position) = cache.positions.get(&entity.handle) else { return false };
+        let Some((_, previous)) = cache.fragments.get(&entity.handle) else { return false };
+        let spent_before = cache.prefix_expansions.get(position).copied().unwrap_or(0);
+        let fragment = if cache.budgeted {
+            let spent = std::sync::atomic::AtomicUsize::new(spent_before);
+            build_entity_with_budget(d, entity, opts, &spent)
+        } else {
+            build_entities(d, std::iter::once(entity.as_ref()), opts)
+        };
+        let Some(&range) = cache.ranges.get(&entity.handle) else { return false };
+        let next_range = FragmentRange::for_fragment(range, &fragment);
+        if !range.same_shape(next_range) && !(changed.len() == 1 && position + 1 == cache.order.len()) {
+            return false;
+        }
+        let next_total = cache.expansion.saturating_sub(previous.expanded).saturating_add(fragment.expanded);
+        if cache.budgeted && previous.expanded != fragment.expanded && position + 1 < cache.order.len() && next_total > super::MAX_BLOCK_EXPANSION {
+            return false;
+        }
+        updates.push((entity.clone(), fragment, range, position));
     }
+
+    let Some(flat_arc) = cache.flat.as_mut() else { return false };
+    let flat = Arc::make_mut(flat_arc);
+    for (entity, fragment, old_range, position) in updates {
+        let Some((_, previous)) = cache.fragments.get(&entity.handle) else { return false };
+        let old_expanded = previous.expanded;
+        let old_bounds = previous.bounds;
+        let old_truncated = previous.truncated;
+        let new_expanded = fragment.expanded;
+        let new_truncated = fragment.truncated;
+        let new_range = if old_range.same_shape(FragmentRange::for_fragment(old_range, &fragment)) {
+            patch_fragment(flat, old_range, &fragment);
+            old_range
+        } else {
+            truncate_fragment_tail(flat, old_range);
+            let before = FragmentRange::at(flat);
+            super::display::append_ref(flat, &fragment);
+            before.finish(flat)
+        };
+        update_bounds(flat, old_bounds, &fragment, &cache.fragments, entity.handle);
+        flat.expanded = cache.expansion.saturating_sub(old_expanded).saturating_add(new_expanded);
+        cache.expansion = flat.expanded;
+        if old_truncated {
+            cache.truncated_fragments = cache.truncated_fragments.saturating_sub(1);
+        }
+        if new_truncated {
+            cache.truncated_fragments = cache.truncated_fragments.saturating_add(1);
+        }
+        flat.truncated = cache.truncated_fragments != 0;
+        if new_expanded != old_expanded {
+            for prefix in cache.prefix_expansions.iter_mut().skip(position.saturating_add(1)) {
+                *prefix = prefix.saturating_sub(old_expanded).saturating_add(new_expanded);
+            }
+        }
+        cache.ranges.insert(entity.handle, new_range);
+        cache.fragments.insert(entity.handle, (entity, fragment));
+    }
+    true
+}
+
+fn patch_fragment(flat: &mut DisplayList, range: FragmentRange, fragment: &DisplayList) {
+    for (dst, source) in flat.prims[range.prims.0..range.prims.0 + range.prims.1].iter_mut().zip(&fragment.prims) {
+        let mut prim = *source;
+        prim.start += if matches!(prim.kind, super::Kind::Tris | super::Kind::Mask) { range.tris.0 as u32 } else { range.verts.0 as u32 };
+        if let super::Kind::Image { index } = &mut prim.kind {
+            *index = index.saturating_add(range.images.0 as u32);
+        }
+        *dst = prim;
+    }
+    flat.verts[range.verts.0..range.verts.0 + range.verts.1].copy_from_slice(&fragment.verts);
+    flat.tris[range.tris.0..range.tris.0 + range.tris.1].copy_from_slice(&fragment.tris);
+    flat.images[range.images.0..range.images.0 + range.images.1].clone_from_slice(&fragment.images);
+    flat.prim_layers[range.prim_layers.0..range.prim_layers.0 + range.prim_layers.1].copy_from_slice(&fragment.prim_layers);
+    for (dst, source) in flat.texts[range.texts.0..range.texts.0 + range.texts.1].iter_mut().zip(&fragment.texts) {
+        let mut text = source.clone();
+        if text.prim < super::PlotText::CLIPPED {
+            text.prim += range.prims.0 as u32;
+        }
+        *dst = text;
+    }
+    flat.pens[range.pens.0..range.pens.0 + range.pens.1].copy_from_slice(&fragment.pens);
+}
+
+fn truncate_fragment_tail(flat: &mut DisplayList, range: FragmentRange) {
+    flat.prims.truncate(range.prims.0);
+    flat.verts.truncate(range.verts.0);
+    flat.tris.truncate(range.tris.0);
+    flat.images.truncate(range.images.0);
+    flat.prim_layers.truncate(range.prim_layers.0);
+    flat.texts.truncate(range.texts.0);
+    flat.pens.truncate(range.pens.0);
+}
+
+fn update_bounds(flat: &mut DisplayList, old: Bounds2, new: &DisplayList, fragments: &HashMap<Handle, (Arc<Entity>, DisplayList)>, changed: Handle) {
+    let b = flat.bounds;
+    let lost_extreme = old.min.x == b.min.x && new.bounds.min.x > b.min.x
+        || old.min.y == b.min.y && new.bounds.min.y > b.min.y
+        || old.max.x == b.max.x && new.bounds.max.x < b.max.x
+        || old.max.y == b.max.y && new.bounds.max.y < b.max.y;
+    if lost_extreme {
+        flat.bounds =
+            fragments.iter().filter(|(handle, _)| **handle != changed).fold(new.bounds, |bounds, (_, (_, fragment))| bounds.union(&fragment.bounds));
+    } else {
+        flat.bounds = flat.bounds.union(&new.bounds);
+    }
+}
+
+fn block_expansion_upper_bound(d: &Drawing, store: &cadcraft_doc::EntityStore) -> usize {
+    let cap = super::MAX_BLOCK_EXPANSION.saturating_add(1);
+    let mut total = 0usize;
+    let mut memo: HashMap<(String, usize), usize> = HashMap::new();
+    let mut active = std::collections::HashSet::new();
+    for entity in store.iter() {
+        if let EntityKind::Insert(insert) = &entity.kind {
+            total = total.saturating_add(insert_expansion_upper_bound(d, insert, 0, cap, &mut memo, &mut active)).min(cap);
+            if total == cap {
+                return cap;
+            }
+        }
+    }
+    total
+}
+
+fn insert_expansion_upper_bound(
+    d: &Drawing,
+    insert: &cadcraft_doc::Insert,
+    depth: usize,
+    cap: usize,
+    memo: &mut HashMap<(String, usize), usize>,
+    active: &mut std::collections::HashSet<(String, usize)>,
+) -> usize {
+    if depth >= cadcraft_doc::MAX_BLOCK_DEPTH {
+        return 0;
+    }
+    if d.block(&insert.block).is_none() {
+        return 0;
+    }
+    let instances = (insert.cols.clamp(1, 10_000) as usize).saturating_mul(insert.rows.clamp(1, 10_000) as usize).min(cap);
+    let body = block_body_expansion_upper_bound(d, &insert.block, depth + 1, cap, memo, active);
+    instances.saturating_mul(body.saturating_add(1).min(cap)).min(cap)
+}
+
+fn block_body_expansion_upper_bound(
+    d: &Drawing,
+    name: &str,
+    entity_depth: usize,
+    cap: usize,
+    memo: &mut HashMap<(String, usize), usize>,
+    active: &mut std::collections::HashSet<(String, usize)>,
+) -> usize {
+    if let Some(value) = memo.get(&(name.to_owned(), entity_depth)) {
+        return *value;
+    }
+    let key = (name.to_owned(), entity_depth);
+    if !active.insert(key.clone()) {
+        return cap;
+    }
+    let Some(block) = d.block(name) else {
+        active.remove(&key);
+        return 0;
+    };
+    let mut total = 0usize;
+    for entity in block.entities.iter() {
+        let nested = match &entity.kind {
+            EntityKind::Insert(insert) => insert_expansion_upper_bound(d, insert, entity_depth, cap, memo, active),
+            _ => 0,
+        };
+        total = total.saturating_add(1).saturating_add(nested).min(cap);
+        if total == cap {
+            break;
+        }
+    }
+    active.remove(&key);
+    memo.insert(key, total);
+    total
 }
 
 /// Build options.
@@ -303,6 +574,22 @@ pub(crate) const PARALLEL_CHUNK: usize = 256;
 fn build_parallel(b: &mut Builder, d: &Drawing, store: &cadcraft_doc::EntityStore) {
     use rayon::prelude::*;
     let ents: Vec<&std::sync::Arc<Entity>> = store.iter().collect();
+    // A raced shared cap lets whichever Rayon worker arrives first claim the last block slots.
+    // If the conservative count can cross the cap, build ordered chunks on this thread so the
+    // same prefix is always retained. Drawings below the cap remain fully parallel.
+    if block_expansion_upper_bound(d, store) > super::MAX_BLOCK_EXPANSION {
+        let budget = std::sync::atomic::AtomicUsize::new(0);
+        let (opts, plotting) = (b.opts, b.plotting);
+        for chunk in ents.chunks(PARALLEL_CHUNK) {
+            let mut part =
+                Builder { list: DisplayList::default(), opts, plotting, styles: None, named: None, shared_budget: Some(&budget), transparency: 0 };
+            for e in chunk {
+                entity(&mut part, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);
+            }
+            append(&mut b.list, part.list);
+        }
+        return;
+    }
     let budget = std::sync::atomic::AtomicUsize::new(0);
     let (opts, plotting) = (b.opts, b.plotting);
     let parts: Vec<DisplayList> = ents
@@ -365,6 +652,20 @@ pub fn build_entities<'a, I: IntoIterator<Item = &'a Entity>>(d: &Drawing, ents:
     for e in ents {
         entity(&mut b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);
     }
+    b.list
+}
+
+fn build_entity_with_budget(d: &Drawing, e: &Entity, opts: &Options, budget: &std::sync::atomic::AtomicUsize) -> DisplayList {
+    let with_view;
+    let opts = if matches!(e.kind, EntityKind::Point(_)) {
+        with_view = with_point_view(d, &Space::Model, opts);
+        &with_view
+    } else {
+        opts
+    };
+    let mut b =
+        Builder { list: DisplayList::default(), opts, plotting: false, styles: None, named: None, shared_budget: Some(budget), transparency: 0 };
+    entity(&mut b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);
     b.list
 }
 

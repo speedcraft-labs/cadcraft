@@ -206,6 +206,7 @@ pub(crate) fn append(dst: &mut DisplayList, src: DisplayList) {
     dst.pens.extend(src.pens);
     dst.bounds = dst.bounds.union(&src.bounds);
     dst.expanded = dst.expanded.saturating_add(src.expanded);
+    dst.truncated |= src.truncated;
 }
 
 /// Append a cached fragment without cloning its backing vectors first.
@@ -235,4 +236,5 @@ pub(crate) fn append_ref(dst: &mut DisplayList, src: &DisplayList) {
     dst.pens.extend_from_slice(&src.pens);
     dst.bounds = dst.bounds.union(&src.bounds);
     dst.expanded = dst.expanded.saturating_add(src.expanded);
+    dst.truncated |= src.truncated;
 }

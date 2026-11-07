@@ -172,6 +172,9 @@ pub(super) fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], c
         }
     }
     let space = st.space.clone();
+    // Let the display cache patch its unique flattened list in place. The old frame is no longer
+    // needed once the synchronous rebuild starts.
+    app.canvas.list = None;
     app.canvas.list = Some(cadcraft_render::build_cached(&st.doc, &space, &opts, &mut app.canvas.entity_display_cache));
     app.canvas.key = key;
     app.canvas.window = opts.view;

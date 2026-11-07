@@ -271,6 +271,32 @@ impl EntityStore {
     pub fn same_as(&self, other: &EntityStore) -> bool {
         self.len == other.len && self.chunks.len() == other.chunks.len() && self.chunks.iter().zip(&other.chunks).all(|(a, b)| Arc::ptr_eq(a, b))
     }
+    /// The entities changed since `previous`, when both stores still have the same draw order.
+    /// Shared chunks are skipped in O(1); a copied chunk is compared by handles and entity Arc
+    /// identity. `None` means insertion, removal, or reordering changed the draw order.
+    pub fn changed_entities(&self, previous: &EntityStore) -> Option<Vec<Arc<Entity>>> {
+        if self.len != previous.len || self.chunks.len() != previous.chunks.len() {
+            return None;
+        }
+        let mut changed = Vec::new();
+        for (current, old) in self.chunks.iter().zip(&previous.chunks) {
+            if current.id != old.id || current.items.len() != old.items.len() {
+                return None;
+            }
+            if Arc::ptr_eq(current, old) {
+                continue;
+            }
+            for (entity, old_entity) in current.items.iter().zip(&old.items) {
+                if entity.handle != old_entity.handle {
+                    return None;
+                }
+                if !Arc::ptr_eq(entity, old_entity) {
+                    changed.push(entity.clone());
+                }
+            }
+        }
+        Some(changed)
+    }
     /// The chunks in draw order as (identity key, entities). A key is stable for as long as any
     /// clone of this store is alive and changes whenever the chunk is edited (copy-on-write), so
     /// caches holding a clone can reuse per-chunk work.
@@ -319,6 +345,23 @@ mod tests {
         assert!(snap.get(Handle(3)).is_some());
         assert_eq!(snap.get(Handle(4)).map(|e| e.common.layer.as_str()), Some("0"));
         assert_eq!(s.get(Handle(4)).map(|e| e.common.layer.as_str()), Some("X"));
+    }
+
+    #[test]
+    fn changed_entities_skips_shared_chunks_and_detects_reordering() {
+        let mut store = EntityStore::new();
+        for h in 1..=6 {
+            store.push(ent(h));
+        }
+        let snapshot = store.clone();
+
+        store.modify(Handle(3), |entity| entity.common.visible = false);
+        let changed = store.changed_entities(&snapshot).expect("same draw order");
+        assert_eq!(changed.iter().map(|entity| entity.handle).collect::<Vec<_>>(), [Handle(3)]);
+        assert!(snapshot.changed_entities(&snapshot).unwrap().is_empty());
+
+        store.bring_to_front(Handle(3));
+        assert!(store.changed_entities(&snapshot).is_none());
     }
 
     #[test]
