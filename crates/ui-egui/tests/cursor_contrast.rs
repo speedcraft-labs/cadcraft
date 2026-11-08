@@ -43,21 +43,45 @@ impl Canvas {
     }
 
     fn paint(&mut self, at: Pos2) -> Vec<egui::epaint::ClippedShape> {
+        self.wait_for_display_list(at);
         let mut shapes = Vec::new();
         // Let layout and hover state settle, as in system_cursor.rs.
         for _ in 0..3 {
-            let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))),
-                events: vec![egui::Event::PointerMoved(at)],
-                ..Default::default()
-            };
-            let mut output = self.ctx.run_ui(input, |ui| {
-                self.app.logic(ui.ctx());
-                self.app.ui(ui);
-            });
-            shapes = std::mem::take(&mut output.shapes);
-            output.textures_delta.clear();
+            shapes = self.frame(at);
         }
+        shapes
+    }
+
+    /// The native canvas installs its first and changed layout lists on a worker. Cursor ink
+    /// over a paper viewport depends on that list, so wait for the matching list before reading
+    /// the rendered cursor shapes.
+    fn wait_for_display_list(&mut self, at: Pos2) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            // Run at least one pass before checking: a layout/view command may have invalidated
+            // the old list without scheduling its replacement yet.
+            self.frame(at);
+            let ready = self.app.canvas.list.is_some() && !self.app.canvas.building();
+            if ready {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "canvas display-list build timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn frame(&mut self, at: Pos2) -> Vec<egui::epaint::ClippedShape> {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))),
+            events: vec![egui::Event::PointerMoved(at)],
+            ..Default::default()
+        };
+        let mut output = self.ctx.run_ui(input, |ui| {
+            self.app.logic(ui.ctx());
+            self.app.ui(ui);
+        });
+        let shapes = std::mem::take(&mut output.shapes);
+        output.textures_delta.clear();
         shapes
     }
 

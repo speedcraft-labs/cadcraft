@@ -130,8 +130,10 @@ pub(super) fn spawn(mut req: Request, key: super::ListKey, window: Option<Bounds
         return None;
     }
     let ctx = ctx.clone();
-    let key_name = format!("cadcraft-display-list-{}-{}", key.0, key.7);
-    let handle = jobs.submit_latest(key_name, Priority::Interactive, move |job_ctx| {
+    // Each canvas owns its handle and cancels its own previous build when it changes view.
+    // A document key is not enough here: separate windows can open the same drawing and each
+    // needs an independent result (and repaint target).
+    let handle = jobs.submit(Priority::Interactive, move |job_ctx| {
         req.opts.cancel = Some(job_ctx.cancellation().atomic_flag());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(req)));
         match result {
