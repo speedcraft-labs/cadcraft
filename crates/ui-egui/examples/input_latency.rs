@@ -40,16 +40,16 @@ fn main() {
     });
     let start = Instant::now();
     h.step();
+    let deadline = start + Duration::from_secs(120);
+    while h.state().canvas.list.is_none() || h.state().canvas.building() {
+        assert!(Instant::now() < deadline, "input-triggered display-list rebuild timed out");
+        h.step();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Count the input only through the first frame after any deferred display-list rebuild lands.
     let latency = start.elapsed();
     let after = h.state().session.state().expect("drawing").view().height;
     assert!((after - before).abs() > 1e-6, "wheel input did not zoom the viewport");
-
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while h.state().canvas.list.is_none() {
-        assert!(Instant::now() < deadline, "initial display-list build timed out");
-        h.step();
-        std::thread::sleep(Duration::from_millis(10));
-    }
     let list = h.state().canvas.list.as_ref().expect("rebuilt display list");
     assert!(!list.prims.is_empty(), "loaded display list is empty");
     // Display-list primitive order and raster-image indices can vary across processes because
