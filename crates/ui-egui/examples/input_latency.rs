@@ -46,12 +46,15 @@ fn main() {
                 let mut endpoints =
                     [[line.a.x.to_bits(), line.a.y.to_bits(), line.a.z.to_bits()], [line.b.x.to_bits(), line.b.y.to_bits(), line.b.z.to_bits()]];
                 endpoints.sort_unstable();
-                Some((endpoints, entity.handle))
+                // Endpoint duplicates occur in this drawing. Break those ties with the full
+                // visual properties, not iteration order or app-assigned object handles.
+                let style = serde_json::to_string(&entity.common).expect("serialize line style");
+                Some((endpoints, style, entity.handle))
             })
             .collect::<Vec<_>>()
     };
-    lines.sort_unstable_by_key(|(endpoints, _)| *endpoints);
-    let (line_key, handle) = lines.into_iter().next().expect("loaded drawing has a line to edit");
+    lines.sort_unstable_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    let (line_key, _style, handle) = lines.into_iter().next().expect("loaded drawing has a line to edit");
     println!("CRAFT_INPUT_LINE_KEY={line_key:?}");
     let revision = h.state().session.state().expect("drawing").revision;
     // Move one entity after the heavy drawing has settled. The resulting display-list rebuild
