@@ -52,17 +52,29 @@ fn main() {
     }
     let list = h.state().canvas.list.as_ref().expect("rebuilt display list");
     assert!(!list.prims.is_empty(), "loaded display list is empty");
-    let mut digest = Sha256::new();
+    // Display-list primitive order can vary between processes because the drawing engine builds
+    // several parts from hash maps. Hash each primitive independently, then sort the fingerprints
+    // so the output check compares the same multiset of primitives on both sides.
+    let mut primitives = Vec::with_capacity(list.prims.len());
     for prim in &list.prims {
-        digest.update(prim.handle.0.to_le_bytes());
-        digest.update([prim.color.0, prim.color.1, prim.color.2, prim.transparency]);
-        digest.update(prim.lw.to_bits().to_le_bytes());
-        digest.update(prim.len.to_le_bytes());
-        digest.update(format!("{:?}", prim.kind).as_bytes());
+        let mut fingerprint = Sha256::new();
+        fingerprint.update(prim.handle.0.to_le_bytes());
+        fingerprint.update([prim.color.0, prim.color.1, prim.color.2, prim.transparency]);
+        fingerprint.update(prim.lw.to_bits().to_le_bytes());
+        fingerprint.update(prim.len.to_le_bytes());
+        fingerprint.update(format!("{:?}", prim.kind).as_bytes());
         for point in list.points(prim) {
-            digest.update(point.x.to_bits().to_le_bytes());
-            digest.update(point.y.to_bits().to_le_bytes());
+            fingerprint.update(point.x.to_bits().to_le_bytes());
+            fingerprint.update(point.y.to_bits().to_le_bytes());
         }
+        let mut primitive = [0; 32];
+        primitive.copy_from_slice(&fingerprint.finalize());
+        primitives.push(primitive);
+    }
+    primitives.sort_unstable();
+    let mut digest = Sha256::new();
+    for primitive in primitives {
+        digest.update(primitive);
     }
 
     println!("CRAFT_JOURNEY_NS={}", latency.as_nanos());
