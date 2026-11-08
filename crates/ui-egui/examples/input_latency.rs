@@ -52,16 +52,39 @@ fn main() {
     }
     let list = h.state().canvas.list.as_ref().expect("rebuilt display list");
     assert!(!list.prims.is_empty(), "loaded display list is empty");
-    // Display-list primitive order can vary between processes because the drawing engine builds
-    // several parts from hash maps. Object handles can also be reassigned across revisions, so
-    // compare rendered content: style and geometry, independent of ordering and selection IDs.
+    // Display-list primitive order and raster-image indices can vary across processes because
+    // the drawing engine builds several parts from hash maps. Object handles can also be
+    // reassigned across revisions, so compare rendered content independent of those IDs.
     let mut primitives = Vec::with_capacity(list.prims.len());
     for prim in &list.prims {
         let mut fingerprint = Sha256::new();
         fingerprint.update([prim.color.0, prim.color.1, prim.color.2, prim.transparency]);
+        fingerprint.update([u8::from(prim.aci7)]);
         fingerprint.update(prim.lw.to_bits().to_le_bytes());
         fingerprint.update(prim.len.to_le_bytes());
-        fingerprint.update(format!("{:?}", prim.kind).as_bytes());
+        match prim.kind {
+            cadcraft_render::Kind::Polyline => fingerprint.update([0]),
+            cadcraft_render::Kind::Tris => fingerprint.update([1]),
+            cadcraft_render::Kind::Mask => fingerprint.update([2]),
+            cadcraft_render::Kind::Point => fingerprint.update([3]),
+            cadcraft_render::Kind::Infinite { ray } => fingerprint.update([4, u8::from(ray)]),
+            cadcraft_render::Kind::Image { index } => {
+                fingerprint.update([5]);
+                let image = &list.images[index as usize];
+                fingerprint.update(image.raster.width().to_le_bytes());
+                fingerprint.update(image.raster.height().to_le_bytes());
+                fingerprint.update(image.raster.rgba());
+                fingerprint.update([image.fade]);
+                fingerprint.update((image.clips.len() as u64).to_le_bytes());
+                for clip in &image.clips {
+                    fingerprint.update((clip.len() as u64).to_le_bytes());
+                    for point in clip {
+                        fingerprint.update(point.x.to_bits().to_le_bytes());
+                        fingerprint.update(point.y.to_bits().to_le_bytes());
+                    }
+                }
+            }
+        }
         for point in list.points(prim) {
             fingerprint.update(point.x.to_bits().to_le_bytes());
             fingerprint.update(point.y.to_bits().to_le_bytes());
