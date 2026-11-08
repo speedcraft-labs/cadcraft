@@ -1,0 +1,70 @@
+//! Input-to-frame latency for the first interaction while a real engineering drawing is loaded.
+
+use cadcraft_engine::Session;
+use cadcraft_ui_egui::{CadApp, Services};
+use egui_kittest::Harness;
+use sha2::{Digest, Sha256};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+fn app(path: &Path) -> CadApp {
+    let bytes = std::fs::read(path).expect("read pinned engineering drawing");
+    let drawing = cadcraft_io::read(&bytes, path).expect("parse pinned engineering drawing");
+    let mut session = Session::new();
+    session.viewport_px = (1400.0, 900.0);
+    session.open_drawing(drawing, "CADCraft Heavy Engineering sample", Some(path.to_string_lossy().into_owned()));
+    CadApp::new(session, Services::default())
+}
+
+fn main() {
+    let input = std::env::args().nth(1).expect("corpus drawing path argument");
+    let path = Path::new(&input);
+    let app = app(path);
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_ui_state(
+        |ui, app: &mut CadApp| {
+            app.logic(ui.ctx());
+            app.ui(ui);
+        },
+        app,
+    );
+    let before = h.state().session.state().expect("drawing").view().height;
+    // The drawing occupies the center of the harness window. Queue a real viewport input before
+    // the first frame, when its initial display-list build must be admitted.
+    h.event(egui::Event::PointerMoved(egui::pos2(700.0, 450.0)));
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, -3.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+        source: egui::MouseWheelSource::Unknown,
+    });
+    let start = Instant::now();
+    h.step();
+    let latency = start.elapsed();
+    let after = h.state().session.state().expect("drawing").view().height;
+    assert!((after - before).abs() > 1e-6, "wheel input did not zoom the viewport");
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while h.state().canvas.list.is_none() {
+        assert!(Instant::now() < deadline, "initial display-list build timed out");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let list = h.state().canvas.list.as_ref().expect("rebuilt display list");
+    assert!(!list.prims.is_empty(), "loaded display list is empty");
+    let mut digest = Sha256::new();
+    for prim in &list.prims {
+        digest.update(prim.handle.0.to_le_bytes());
+        digest.update([prim.color.0, prim.color.1, prim.color.2, prim.transparency]);
+        digest.update(prim.lw.to_bits().to_le_bytes());
+        digest.update(prim.len.to_le_bytes());
+        digest.update(format!("{:?}", prim.kind).as_bytes());
+        for point in list.points(prim) {
+            digest.update(point.x.to_bits().to_le_bytes());
+            digest.update(point.y.to_bits().to_le_bytes());
+        }
+    }
+
+    println!("CRAFT_JOURNEY_NS={}", latency.as_nanos());
+    println!("CRAFT_OUTPUT_SHA256={:x}", digest.finalize());
+}

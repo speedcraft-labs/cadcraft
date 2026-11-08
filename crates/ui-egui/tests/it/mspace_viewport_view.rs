@@ -64,6 +64,22 @@ fn harness(clipped: bool) -> Harness<'static, CadApp> {
         st.set_view_quiet(v);
     }
     h.run_steps(2);
+    // Native canvases install the initial and settled layout lists from the worker pool.
+    // Wait for the view set above to finish before returning a harness to these assertions.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let ready = if clipped {
+            h.state().canvas.list.as_ref().is_some_and(|list| list.prims.iter().any(|prim| prim.handle == VIEWPORT_CONTENT))
+        } else {
+            h.state().canvas.viewport_content().is_some()
+        };
+        if ready && !h.state().canvas.building() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "initial layout display-list build timed out");
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     h
 }
 
@@ -79,6 +95,25 @@ fn in_layout_list(h: &Harness<'_, CadApp>) -> Bounds2 {
         .iter()
         .filter(|p| p.handle == VIEWPORT_CONTENT)
         .fold(Bounds2::EMPTY, |b, p| b.union(&Bounds2::from_points(list.points(p).iter().copied())))
+}
+
+/// Wait for an asynchronously rebuilt layout list to show the active viewport's contents.
+fn wait_for_layout_contents(h: &mut Harness<'_, CadApp>, min_x: f64, max_x: f64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let bounds = h.state().canvas.list.as_ref().map(|list| {
+            list.prims
+                .iter()
+                .filter(|p| p.handle == VIEWPORT_CONTENT)
+                .fold(Bounds2::EMPTY, |b, p| b.union(&Bounds2::from_points(list.points(p).iter().copied())))
+        });
+        if !h.state().canvas.building() && bounds.is_some_and(|b| spans(b, min_x, max_x)) {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "layout display-list build timed out");
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 }
 
 fn revision(h: &Harness<'_, CadApp>) -> u64 {
@@ -167,6 +202,7 @@ fn leaving_the_viewport_puts_its_contents_back_in_the_layout() {
     h.run_steps(2);
     h.state_mut().session.execute("pspace", &json!({})).unwrap();
     h.run_steps(2);
+    wait_for_layout_contents(&mut h, 4.1, 7.1);
     assert!(h.state().canvas.viewport_content().is_none());
     let b = in_layout_list(&h);
     assert!(spans(b, 4.1, 7.1), "{b:?}");
@@ -184,6 +220,7 @@ fn without_a_stencil_buffer_a_clipped_viewport_follows_realtime_navigation_in_th
         pan(&mut h, 2.0);
         h.run_steps(2);
     }
+    wait_for_layout_contents(&mut h, 4.1, 7.1);
     let b = in_layout_list(&h);
     assert!(spans(b, 4.1, 7.1), "{b:?}");
 }
