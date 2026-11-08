@@ -53,12 +53,11 @@ fn main() {
     let list = h.state().canvas.list.as_ref().expect("rebuilt display list");
     assert!(!list.prims.is_empty(), "loaded display list is empty");
     // Display-list primitive order can vary between processes because the drawing engine builds
-    // several parts from hash maps. Hash each primitive independently, then sort the fingerprints
-    // so the output check compares the same multiset of primitives on both sides.
+    // several parts from hash maps. Object handles can also be reassigned across revisions, so
+    // compare rendered content: style and geometry, independent of ordering and selection IDs.
     let mut primitives = Vec::with_capacity(list.prims.len());
     for prim in &list.prims {
         let mut fingerprint = Sha256::new();
-        fingerprint.update(prim.handle.0.to_le_bytes());
         fingerprint.update([prim.color.0, prim.color.1, prim.color.2, prim.transparency]);
         fingerprint.update(prim.lw.to_bits().to_le_bytes());
         fingerprint.update(prim.len.to_le_bytes());
