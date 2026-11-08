@@ -130,6 +130,46 @@ fn readback_hash(rs: &egui_wgpu::RenderState, texture: &wgpu::Texture) -> Result
     Ok(hash)
 }
 
+fn render_callback(
+    rs: &egui_wgpu::RenderState,
+    texture: &wgpu::TextureView,
+    screen: &ScreenDescriptor,
+    callback: &CanvasCallback,
+    faults: &GpuFaults,
+) -> Result<(Duration, Duration), Box<dyn Error>> {
+    let mut encoder = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("cadcraft edit frame") });
+    let mut renderer = rs.renderer.write();
+    let upload_started = Instant::now();
+    let _ = callback.prepare(&rs.device, &rs.queue, screen, &mut encoder, &mut renderer.callback_resources);
+    let upload_time = upload_started.elapsed();
+    let draw_started = Instant::now();
+    {
+        let mut pass = encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("cadcraft edit frame"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: texture,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store },
+                    depth_slice: None,
+                })],
+                ..Default::default()
+            })
+            .forget_lifetime();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(WIDTH as f32, HEIGHT as f32));
+        let info = egui::PaintCallbackInfo { viewport: rect, clip_rect: rect, pixels_per_point: 1.0, screen_size_px: [WIDTH, HEIGHT] };
+        callback.paint(info, &mut pass, &renderer.callback_resources);
+    }
+    rs.queue.submit([encoder.finish()]);
+    rs.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(Duration::from_secs(60)) })?;
+    let draw_time = draw_started.elapsed();
+    drop(renderer);
+    if let Some(fault) = faults.take() {
+        return Err(format!("GPU callback fault: {}", fault.message).into());
+    }
+    Ok((upload_time, draw_time))
+}
+
 fn run(path: &Path) -> Result<(), Box<dyn Error>> {
     let bytes = fs::read(path)?;
     let drawing = cadcraft_io::read(&bytes, path)?;
@@ -141,30 +181,10 @@ fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         .map(|entity| entity.handle)
         .or_else(|| store.iter().last().map(|entity| entity.handle))
         .ok_or("drawing has no editable entity")?;
-    let mut edited = drawing.clone();
-    let store = edited.space_mut(&Space::Model).ok_or("edited drawing has no model space")?;
-    if !store.modify(handle, |entity| {
-        if let EntityKind::Hatch(hatch) = &mut entity.kind {
-            hatch.scale *= 1.1;
-        } else {
-            entity.common.color = match entity.common.color {
-                cadcraft_doc::color::Color::Index(1) => cadcraft_doc::color::Color::Index(2),
-                _ => cadcraft_doc::color::Color::Index(1),
-            };
-        }
-    }) {
-        return Err("could not edit selected entity".into());
-    }
-
     let mode = std::env::var("CADCRAFT_PERF_EDIT_MODE").unwrap_or_else(|_| "incremental".into());
     if mode != "full" && mode != "incremental" {
         return Err(format!("unknown CADCRAFT_PERF_EDIT_MODE={mode:?}").into());
     }
-    let mut cache = cadcraft_render::EntityDisplayCache::default();
-    if mode == "incremental" {
-        let _ = build_cached(&drawing, &Space::Model, &options, &mut cache);
-    }
-
     let rs = nvidia_state();
     let adapter = rs.adapter.get_info();
     let faults = Arc::new(GpuFaults::default());
@@ -186,18 +206,78 @@ fn run(path: &Path) -> Result<(), Box<dyn Error>> {
     let scale = (WIDTH as f64 / extents.width()).min(HEIGHT as f64 / extents.height());
     let center = extents.center();
 
+    // Load and draw the original document once, outside the measured edit frame.
+    let base_list = Arc::new(build(&drawing, &Space::Model, &options));
+    let mut cache = cadcraft_render::EntityDisplayCache::default();
+    let (initial_mesh, ranges) = if mode == "incremental" {
+        let cached = build_cached(&drawing, &Space::Model, &options, &mut cache);
+        if !same_list(&base_list, &cached) {
+            return Err(format!("full and cached base lists differ: full [{}], cached [{}]", list_summary(&base_list), list_summary(&cached)).into());
+        }
+        gpu::build_mesh_entities(&cached, cache.fragments(), gpu::choose_origin(&cached.bounds, center, HEIGHT as f64 / scale), BACKGROUND, false)
+    } else {
+        (gpu::build_mesh(&base_list, gpu::choose_origin(&base_list.bounds, center, HEIGHT as f64 / scale), BACKGROUND, false), Default::default())
+    };
+    let base_origin = gpu::choose_origin(&base_list.bounds, center, HEIGHT as f64 / scale);
+    let slot: MeshSlot = Arc::new(Mutex::new(Some(initial_mesh)));
+    let base_callback = CanvasCallback {
+        key: 1,
+        slot: slot.clone(),
+        offset: [(base_origin.x - center.x) as f32, (base_origin.y - center.y) as f32],
+        scale: scale as f32,
+        center: [WIDTH as f32 * 0.5, HEIGHT as f32 * 0.5],
+        layer: LAYER_DRAWING,
+        xform: gpu::IDENTITY_XFORM,
+        dash: 0.0,
+        stencil: Stencil::Off,
+    };
+    let _ = render_callback(&rs, &view, &screen, &base_callback, &faults)?;
+
+    let mut edited = drawing.clone();
+    let store = edited.space_mut(&Space::Model).ok_or("edited drawing has no model space")?;
+    if !store.modify(handle, |entity| {
+        if let EntityKind::Hatch(hatch) = &mut entity.kind {
+            hatch.scale *= 1.1;
+        } else {
+            entity.common.color = match entity.common.color {
+                cadcraft_doc::color::Color::Index(1) => cadcraft_doc::color::Color::Index(2),
+                _ => cadcraft_doc::color::Color::Index(1),
+            };
+        }
+    }) {
+        return Err("could not edit selected entity".into());
+    }
+
     let started = Instant::now();
+    let list_started = Instant::now();
     let list =
         if mode == "full" { Arc::new(build(&edited, &Space::Model, &options)) } else { build_cached(&edited, &Space::Model, &options, &mut cache) };
-    let list_time = started.elapsed();
+    let list_time = list_started.elapsed();
     let mesh_started = Instant::now();
     let origin = gpu::choose_origin(&list.bounds, center, HEIGHT as f64 / scale);
-    let mesh = gpu::build_mesh(&list, origin, BACKGROUND, false);
+    let (mesh, update_path) = if mode == "full" {
+        (gpu::build_mesh(&list, origin, BACKGROUND, false), "full mesh rebuild")
+    } else {
+        let patch = cache.take_gpu_changes().and_then(|changed| {
+            let [changed] = changed.as_slice() else { return None };
+            let range = *ranges.get(changed)?;
+            let fragment = cache.fragment(*changed)?;
+            gpu::build_mesh_patch(fragment, origin, BACKGROUND, false, 1, range, list.clone())
+        });
+        if let Some(patch) = patch {
+            (patch, "single-entity GPU patch")
+        } else if cache.has_cached_fragments() {
+            let (full, _) = gpu::build_mesh_entities(&list, cache.fragments(), origin, BACKGROUND, false);
+            (full, "full mesh fallback")
+        } else {
+            (gpu::build_mesh(&list, origin, BACKGROUND, false), "full mesh fallback")
+        }
+    };
     let mesh_time = mesh_started.elapsed();
-    let slot: MeshSlot = Arc::new(Mutex::new(Some(mesh)));
+    *slot.lock().map_err(|_| std::io::Error::other("GPU mesh slot poisoned"))? = Some(mesh);
     let callback = CanvasCallback {
-        key: 1,
-        slot,
+        key: 2,
+        slot: slot.clone(),
         offset: [(origin.x - center.x) as f32, (origin.y - center.y) as f32],
         scale: scale as f32,
         center: [WIDTH as f32 * 0.5, HEIGHT as f32 * 0.5],
@@ -206,55 +286,17 @@ fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         dash: 0.0,
         stencil: Stencil::Off,
     };
-    let mut encoder = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("cadcraft edit frame") });
-    let mut renderer = rs.renderer.write();
-    let upload_started = Instant::now();
-    let _ = callback.prepare(&rs.device, &rs.queue, &screen, &mut encoder, &mut renderer.callback_resources);
-    let upload_time = upload_started.elapsed();
-    let draw_started = Instant::now();
-    {
-        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(WIDTH as f32, HEIGHT as f32));
-        let mut pass = encoder
-            .begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("cadcraft edit frame"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store },
-                    depth_slice: None,
-                })],
-                ..Default::default()
-            })
-            .forget_lifetime();
-        let info = egui::PaintCallbackInfo { viewport: rect, clip_rect: rect, pixels_per_point: 1.0, screen_size_px: [WIDTH, HEIGHT] };
-        callback.paint(info, &mut pass, &renderer.callback_resources);
-    }
-    rs.queue.submit([encoder.finish()]);
-    rs.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(Duration::from_secs(60)) })?;
+    let (upload_time, draw_time) = render_callback(&rs, &view, &screen, &callback, &faults)?;
     let elapsed = started.elapsed();
-    let draw_time = draw_started.elapsed();
-    drop(renderer);
-    if let Some(fault) = faults.take() {
-        return Err(format!("GPU callback fault: {}", fault.message).into());
-    }
 
-    let full = if mode == "full" { list.as_ref().clone() } else { build(&edited, &Space::Model, &options) };
-    if mode == "full" {
-        let mut verify_cache = cadcraft_render::EntityDisplayCache::default();
-        let _ = build_cached(&drawing, &Space::Model, &options, &mut verify_cache);
-        let cached = build_cached(&edited, &Space::Model, &options, &mut verify_cache);
-        if !same_list(&full, &cached) {
-            return Err(
-                format!("full and incremental display lists differ: full [{}], cached [{}]", list_summary(&full), list_summary(&cached)).into()
-            );
-        }
-    } else if !same_list(&full, &list) {
+    let full = build(&edited, &Space::Model, &options);
+    if !same_list(&full, &list) {
         return Err(format!("full and incremental display lists differ: full [{}], cached [{}]", list_summary(&full), list_summary(&list)).into());
     }
     let pixels = readback_hash(&rs, &texture)?;
     let output = stable_hash(&full);
     println!("GPU adapter: {} ({:?}, vendor {:04x})", adapter.name, adapter.device_type, adapter.vendor);
-    println!("drawing: {} entities; edited handle {:?}; list primitives {}", drawing.entity_count(), handle, list.prims.len());
+    println!("drawing: {} entities; edited handle {:?}; list primitives {}; update {update_path}", drawing.entity_count(), handle, list.prims.len());
     println!(
         "frame stages: list {:.2} ms, mesh {:.2} ms, upload {:.2} ms, draw/wait {:.2} ms",
         list_time.as_secs_f64() * 1000.0,

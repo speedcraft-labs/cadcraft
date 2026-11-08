@@ -8,6 +8,7 @@ use cadcraft_engine::snap::{self, SnapHit};
 use cadcraft_geom::{Bounds2, Mat3, Vec2};
 use cadcraft_render::{DisplayList, Kind};
 use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, pos2, vec2};
+use std::collections::HashMap;
 
 use crate::CadApp;
 use crate::theme::Tokens;
@@ -122,6 +123,8 @@ pub struct CanvasState {
     pub gpu_device: Option<egui_wgpu::wgpu::Device>,
     /// The mesh last handed to the GPU (see [`crate::gpu::CanvasCallback::key`]).
     mesh_key: Option<u64>,
+    /// Entity byte ranges in the uploaded mesh, retained for stable-shape edits.
+    gpu_entity_ranges: HashMap<Handle, crate::gpu::EntityMeshRange>,
     mesh_slot: crate::gpu::MeshSlot,
     mesh_origin: Vec2,
     /// The dragged objects of a MOVE/COPY/ROTATE/SCALE preview, uploaded once per drag (see
@@ -226,6 +229,8 @@ impl CanvasState {
     /// Put a finished background build in place, with its GPU vertex data when it has some.
     fn install(&mut self, key: ListKey, window: Option<Bounds2>, built: rebuild::Built) {
         self.list_gen = self.list_gen.wrapping_add(1);
+        self.gpu_entity_ranges.clear();
+        self.entity_display_cache.clear();
         if let Some(m) = built.mesh {
             if let Ok(mut slot) = self.mesh_slot.lock() {
                 *slot = Some(m.data);

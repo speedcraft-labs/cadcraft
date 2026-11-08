@@ -283,11 +283,29 @@ pub(super) fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg:
     let key = list_mesh_key(&c.key, c.list_gen, origin, bg, lwdisplay);
     if c.mesh_key != Some(key) {
         let t0 = crate::now_ms();
-        let mesh = crate::gpu::build_mesh(list, origin, bg, lwdisplay);
+        let changes = c.entity_display_cache.take_gpu_changes();
+        let mesh = changes.as_ref().and_then(|changed| {
+            let [handle] = changed.as_slice() else { return None };
+            let base_key = c.mesh_key?;
+            let range = *c.gpu_entity_ranges.get(handle)?;
+            let fragment = c.entity_display_cache.fragment(*handle)?;
+            crate::gpu::build_mesh_patch(fragment, origin, bg, lwdisplay, base_key, range, list.clone())
+        });
+        let mesh = if let Some(mesh) = mesh {
+            mesh
+        } else if c.entity_display_cache.has_cached_fragments() {
+            let (mesh, ranges) = crate::gpu::build_mesh_entities(list, c.entity_display_cache.fragments(), origin, bg, lwdisplay);
+            c.gpu_entity_ranges = ranges;
+            c.infinite = list.prims.iter().enumerate().filter(|(_, pr)| matches!(pr.kind, Kind::Infinite { .. })).map(|(i, _)| i).collect();
+            mesh
+        } else {
+            c.gpu_entity_ranges.clear();
+            c.infinite = list.prims.iter().enumerate().filter(|(_, pr)| matches!(pr.kind, Kind::Infinite { .. })).map(|(i, _)| i).collect();
+            crate::gpu::build_mesh(list, origin, bg, lwdisplay)
+        };
         if let Ok(mut slot) = c.mesh_slot.lock() {
             *slot = Some(mesh);
         }
-        c.infinite = list.prims.iter().enumerate().filter(|(_, pr)| matches!(pr.kind, Kind::Infinite { .. })).map(|(i, _)| i).collect();
         c.mesh_key = Some(key);
         c.mesh_origin = origin;
         c.mesh_ms = crate::now_ms() - t0;

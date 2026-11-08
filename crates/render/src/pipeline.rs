@@ -89,6 +89,9 @@ pub struct EntityDisplayCache {
     // Raster images can load after the first list build without changing an entity. Retain the
     // immutable map so a COW image load invalidates cached IMAGE fragments too.
     rasters: Option<cadcraft_doc::Rasters>,
+    // `None` means the fragment set was rebuilt; `Some(handles)` lists only changed fragments.
+    // The canvas uses this to update existing GPU buffers after a one-entity edit.
+    gpu_changes: Option<Vec<Handle>>,
 }
 
 impl EntityDisplayCache {
@@ -106,6 +109,27 @@ impl EntityDisplayCache {
         self.budgeted = false;
         self.block_versions.clear();
         self.rasters = None;
+        self.gpu_changes = None;
+    }
+
+    /// The handles changed by the latest cache build (`None` means rebuild the full GPU mesh).
+    pub fn take_gpu_changes(&mut self) -> Option<Vec<Handle>> {
+        self.gpu_changes.take()
+    }
+
+    /// Cached per-entity display fragments in drawing order.
+    pub fn fragments(&self) -> impl Iterator<Item = (Handle, &DisplayList)> {
+        self.order.iter().filter_map(move |handle| self.fragments.get(handle).map(|(_, list)| (*handle, list)))
+    }
+
+    /// Whether the flattened list was built from cacheable per-entity fragments.
+    pub fn has_cached_fragments(&self) -> bool {
+        self.flat.is_some()
+    }
+
+    /// The cached display fragment for `handle`.
+    pub fn fragment(&self, handle: Handle) -> Option<&DisplayList> {
+        self.fragments.get(&handle).map(|(_, list)| list)
     }
 }
 
@@ -162,6 +186,7 @@ pub fn build_cached(d: &Drawing, space: &Space, opts: &Options, cache: &mut Enti
         cache.block_versions = d.blocks.values().cloned().collect();
         cache.rasters = Some(d.rasters.clone());
     }
+    cache.gpu_changes = Some(Vec::new());
 
     let changes = if options_changed { None } else { cache.store_snapshot.as_ref().and_then(|old| store.changed_entities(old)) };
     if let Some(changed) = changes.as_ref() {
@@ -171,6 +196,7 @@ pub fn build_cached(d: &Drawing, space: &Space, opts: &Options, cache: &mut Enti
         }
         if !changed.is_empty() {
             if cache.flat.is_some() && apply_cached_changes(d, opts, cache, changed) {
+                cache.gpu_changes = Some(changed.iter().map(|entity| entity.handle).collect());
                 cache.store_snapshot = Some(store.clone());
                 return cache.flat.as_ref().map(Arc::clone).unwrap_or_else(|| Arc::new(build(d, space, opts)));
             }
@@ -198,6 +224,7 @@ fn populate_cache(
     entities: &[Arc<Entity>],
     budgeted: bool,
 ) -> Arc<DisplayList> {
+    cache.gpu_changes = None;
     cache.fragments.clear();
     cache.ranges.clear();
     cache.order.clear();

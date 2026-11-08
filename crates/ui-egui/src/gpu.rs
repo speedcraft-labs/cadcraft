@@ -15,9 +15,11 @@
 //! Infinite lines (xline/ray) and all overlays stay egui shapes (see `canvas.rs`), and the
 //! canvas falls back to the CPU path when no wgpu render state was handed to the app.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use cadcraft_color::Rgb;
+use cadcraft_doc::Handle;
 use cadcraft_geom::{Bounds2, Vec2};
 use cadcraft_render::{DisplayList, Kind};
 use egui_wgpu::wgpu;
@@ -109,6 +111,34 @@ pub struct MeshData {
     /// The vertex buffers already created from this data (see [`MeshData::upload_now`]); the
     /// paint callback then only swaps them in.
     uploaded: Option<Uploaded>,
+    /// One entity's bytes can be written into its existing ranges when the display-list shape is
+    /// unchanged. A failed range check rebuilds from `full_list` in the callback.
+    patch: Option<MeshPatch>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EntityMeshRange {
+    /// Primitive indices in the flattened list (needed to keep CPU-drawn infinite lines valid).
+    pub prims: (usize, usize),
+    /// Byte offset and length in the full line buffer.
+    pub lines: (usize, usize),
+    /// Byte offset and length in the full triangle buffer.
+    pub tris: (usize, usize),
+    /// Byte offset and length in the full quad-instance buffer.
+    pub quads: (usize, usize),
+    /// Wipeout draw breaks make partial updates order-sensitive, so those fragments rebuild fully.
+    pub has_breaks: bool,
+    /// Infinite lines are indexed and clipped on the CPU, so their edit rebuilds those indices.
+    pub has_infinite: bool,
+}
+
+struct MeshPatch {
+    base_key: u64,
+    range: EntityMeshRange,
+    full_list: Arc<DisplayList>,
+    origin: Vec2,
+    bg: Rgb,
+    lwdisplay: bool,
 }
 
 /// GPU buffers made ahead of the frame that draws them.
@@ -123,7 +153,7 @@ impl MeshData {
     /// buffer zero-fills and copies it: about 0.35 s for a million-primitive drawing, which a
     /// background rebuild does off the UI thread (see `canvas::rebuild`).
     pub fn upload_now(&mut self, device: &wgpu::Device) {
-        let usage = wgpu::BufferUsages::VERTEX;
+        let usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
         self.uploaded = Some(Uploaded {
             lines: upload(device, "cad_lines", &self.lines, VERTEX_SIZE, usage),
             tris: upload(device, "cad_fills", &self.tris, VERTEX_SIZE, usage),
@@ -187,7 +217,79 @@ pub fn build_mesh(list: &DisplayList, origin: Vec2, bg: Rgb, lwdisplay: bool) ->
         quads: Vec::new(),
         breaks: Vec::new(),
         uploaded: None,
+        patch: None,
     };
+    append_mesh(&mut m, list, origin, bg, lwdisplay);
+    m
+}
+
+/// Build one full mesh while recording each cached entity fragment's byte ranges.
+pub fn build_mesh_entities<'a>(
+    list: &DisplayList,
+    fragments: impl IntoIterator<Item = (Handle, &'a DisplayList)>,
+    origin: Vec2,
+    bg: Rgb,
+    lwdisplay: bool,
+) -> (MeshData, HashMap<Handle, EntityMeshRange>) {
+    let mut mesh = MeshData {
+        lines: Vec::with_capacity(list.segment_count().saturating_mul(2 * VERTEX_SIZE)),
+        tris: Vec::with_capacity(list.tris.len().saturating_mul(VERTEX_SIZE)),
+        quads: Vec::new(),
+        breaks: Vec::new(),
+        uploaded: None,
+        patch: None,
+    };
+    let mut ranges = HashMap::new();
+    let mut prim_offset = 0usize;
+    for (handle, fragment) in fragments {
+        let prims = prim_offset;
+        let lines = mesh.lines.len();
+        let tris = mesh.tris.len();
+        let quads = mesh.quads.len();
+        let breaks = mesh.breaks.len();
+        append_mesh(&mut mesh, fragment, origin, bg, lwdisplay);
+        ranges.insert(
+            handle,
+            EntityMeshRange {
+                prims: (prims, fragment.prims.len()),
+                lines: (lines, mesh.lines.len() - lines),
+                tris: (tris, mesh.tris.len() - tris),
+                quads: (quads, mesh.quads.len() - quads),
+                has_breaks: mesh.breaks.len() != breaks,
+                has_infinite: fragment.prims.iter().any(|prim| matches!(prim.kind, Kind::Infinite { .. })),
+            },
+        );
+        prim_offset += fragment.prims.len();
+    }
+    (mesh, ranges)
+}
+
+/// Build one changed fragment for in-place writes into its old full-mesh ranges.
+pub fn build_mesh_patch(
+    list: &DisplayList,
+    origin: Vec2,
+    bg: Rgb,
+    lwdisplay: bool,
+    base_key: u64,
+    range: EntityMeshRange,
+    full_list: Arc<DisplayList>,
+) -> Option<MeshData> {
+    if range.has_breaks
+        || range.has_infinite
+        || list.prims.len() != range.prims.1
+        || list.prims.iter().any(|prim| matches!(prim.kind, Kind::Infinite { .. }))
+    {
+        return None;
+    }
+    let mut mesh = build_mesh(list, origin, bg, lwdisplay);
+    if !mesh.breaks.is_empty() || mesh.lines.len() != range.lines.1 || mesh.tris.len() != range.tris.1 || mesh.quads.len() != range.quads.1 {
+        return None;
+    }
+    mesh.patch = Some(MeshPatch { base_key, range, full_list, origin, bg, lwdisplay });
+    Some(mesh)
+}
+
+fn append_mesh(m: &mut MeshData, list: &DisplayList, origin: Vec2, bg: Rgb, lwdisplay: bool) {
     for prim in &list.prims {
         let col = premultiplied(prim.display_rgb(bg), prim.alpha());
         let pts = list.points(prim);
@@ -236,7 +338,6 @@ pub fn build_mesh(list: &DisplayList, origin: Vec2, bg: Rgb, lwdisplay: bool) ->
             Kind::Image { .. } => {}
         }
     }
-    m
 }
 
 /// Vertex data drawing primitives `prims` of `list` in `color` (the selection highlight), as on
@@ -616,6 +717,60 @@ fn upload(device: &wgpu::Device, label: &str, bytes: &[u8], stride: usize, usage
         .collect()
 }
 
+fn install_mesh(device: &wgpu::Device, layer: &mut Layer, mesh: &mut MeshData) {
+    if mesh.uploaded.is_none() {
+        mesh.upload_now(device);
+    }
+    if let Some(uploaded) = mesh.uploaded.take() {
+        (layer.lines, layer.tris, layer.quads) = (uploaded.lines, uploaded.tris, uploaded.quads);
+        layer.breaks = std::mem::take(&mut mesh.breaks);
+    }
+}
+
+type BufferWrite = (usize, u64, std::ops::Range<usize>);
+
+fn patch_ranges(batches: &[Batch], offset: usize, stride: usize, bytes: &[u8]) -> Option<Vec<BufferWrite>> {
+    if stride == 0 || offset % stride != 0 || bytes.len() % stride != 0 {
+        return None;
+    }
+    let end = offset.checked_add(bytes.len())?;
+    let mut batch_start = 0usize;
+    let mut covered = offset;
+    let mut writes = Vec::new();
+    for (index, batch) in batches.iter().enumerate() {
+        let batch_end = batch_start.checked_add((batch.count as usize).checked_mul(stride)?)?;
+        let start = offset.max(batch_start);
+        let finish = end.min(batch_end);
+        if start < finish {
+            if start != covered {
+                return None;
+            }
+            writes.push((index, u64::try_from(start - batch_start).ok()?, start - offset..finish - offset));
+            covered = finish;
+        }
+        batch_start = batch_end;
+    }
+    if end <= batch_start && covered == end { Some(writes) } else { None }
+}
+
+fn write_ranges(queue: &wgpu::Queue, batches: &[Batch], bytes: &[u8], writes: &[BufferWrite]) {
+    for (index, offset, range) in writes {
+        if let Some(batch) = batches.get(*index) {
+            queue.write_buffer(&batch.buffer, *offset, &bytes[range.clone()]);
+        }
+    }
+}
+
+fn apply_mesh_patch(queue: &wgpu::Queue, layer: &Layer, mesh: &MeshData, patch: &MeshPatch) -> bool {
+    let Some(lines) = patch_ranges(&layer.lines, patch.range.lines.0, VERTEX_SIZE, &mesh.lines) else { return false };
+    let Some(tris) = patch_ranges(&layer.tris, patch.range.tris.0, VERTEX_SIZE, &mesh.tris) else { return false };
+    let Some(quads) = patch_ranges(&layer.quads, patch.range.quads.0, INSTANCE_SIZE, &mesh.quads) else { return false };
+    write_ranges(queue, &layer.lines, &mesh.lines, &lines);
+    write_ranges(queue, &layer.tris, &mesh.tris, &tris);
+    write_ranges(queue, &layer.quads, &mesh.quads, &quads);
+    true
+}
+
 /// GPU trouble wgpu reported: uncaptured errors (validation, out of memory) and the device being
 /// lost (a driver reset or a hung GPU). wgpu's default handler panics on the first uncaptured
 /// error, closing the app with any unsaved work (#602); the handlers [`install`] registers record
@@ -711,15 +866,20 @@ impl egui_wgpu::CallbackTrait for CanvasCallback {
         let Some(res) = res.layers.get_mut(self.layer) else { return Vec::new() };
         if res.key != Some(self.key) {
             let pending = self.slot.lock().ok().and_then(|mut s| s.take());
-            if let Some(mut m) = pending {
-                if m.uploaded.is_none() {
-                    m.upload_now(device);
+            if let Some(mut mesh) = pending {
+                if let Some(patch) = mesh.patch.take() {
+                    let applied = res.key == Some(patch.base_key) && apply_mesh_patch(queue, res, &mesh, &patch);
+                    if applied {
+                        res.key = Some(self.key);
+                    } else {
+                        let mut full = build_mesh(&patch.full_list, patch.origin, patch.bg, patch.lwdisplay);
+                        install_mesh(device, res, &mut full);
+                        res.key = Some(self.key);
+                    }
+                } else {
+                    install_mesh(device, res, &mut mesh);
+                    res.key = Some(self.key);
                 }
-                if let Some(u) = m.uploaded {
-                    (res.lines, res.tris, res.quads) = (u.lines, u.tris, u.quads);
-                }
-                res.breaks = m.breaks;
-                res.key = Some(self.key);
             }
         }
         let ppp = screen.pixels_per_point;
