@@ -86,9 +86,30 @@ fn main() {
                 }
             }
         }
-        for point in list.points(prim) {
-            fingerprint.update(point.x.to_bits().to_le_bytes());
-            fingerprint.update(point.y.to_bits().to_le_bytes());
+        let points = list.points(prim);
+        if matches!(prim.kind, cadcraft_render::Kind::Tris | cadcraft_render::Kind::Mask) {
+            // Triangle order and winding have no effect on the filled output, but hatch
+            // tessellation may emit them in a different order across processes.
+            let mut triangles = points
+                .chunks_exact(3)
+                .map(|triangle| {
+                    let mut vertices: [(u64, u64); 3] = std::array::from_fn(|i| (triangle[i].x.to_bits(), triangle[i].y.to_bits()));
+                    vertices.sort_unstable();
+                    vertices
+                })
+                .collect::<Vec<_>>();
+            triangles.sort_unstable();
+            for triangle in triangles {
+                for (x, y) in triangle {
+                    fingerprint.update(x.to_le_bytes());
+                    fingerprint.update(y.to_le_bytes());
+                }
+            }
+        } else {
+            for point in points {
+                fingerprint.update(point.x.to_bits().to_le_bytes());
+                fingerprint.update(point.y.to_bits().to_le_bytes());
+            }
         }
         let mut primitive = [0; 32];
         primitive.copy_from_slice(&fingerprint.finalize());
