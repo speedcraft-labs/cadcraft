@@ -4,6 +4,7 @@ use cadcraft_engine::Session;
 use cadcraft_ui_egui::{CadApp, Services};
 use egui_kittest::Harness;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -33,16 +34,25 @@ fn main() {
         h.step();
         std::thread::sleep(Duration::from_millis(1));
     }
-    let handle = h
-        .state()
-        .session
-        .state()
-        .expect("drawing")
-        .doc
-        .space(&h.state().session.state().expect("drawing").space)
-        .and_then(|space| space.iter().find(|entity| matches!(&entity.kind, cadcraft_doc::EntityKind::Line(_))))
-        .map(|entity| entity.handle)
-        .expect("loaded drawing has a line to edit");
+    let mut lines = {
+        let state = h.state().session.state().expect("drawing");
+        state
+            .doc
+            .space(&state.space)
+            .expect("drawing space")
+            .iter()
+            .filter_map(|entity| {
+                let cadcraft_doc::EntityKind::Line(line) = &entity.kind else { return None };
+                let mut endpoints =
+                    [[line.a.x.to_bits(), line.a.y.to_bits(), line.a.z.to_bits()], [line.b.x.to_bits(), line.b.y.to_bits(), line.b.z.to_bits()]];
+                endpoints.sort_unstable();
+                Some((endpoints, entity.handle))
+            })
+            .collect::<Vec<_>>()
+    };
+    lines.sort_unstable_by_key(|(endpoints, _)| *endpoints);
+    let (line_key, handle) = lines.into_iter().next().expect("loaded drawing has a line to edit");
+    println!("CRAFT_INPUT_LINE_KEY={line_key:?}");
     let revision = h.state().session.state().expect("drawing").revision;
     // Move one entity after the heavy drawing has settled. The resulting display-list rebuild
     // is the UI-thread stall this journey targets; the first paint is timed, while completion is
@@ -64,20 +74,29 @@ fn main() {
     // the drawing engine builds several parts from hash maps. Object handles can also be
     // reassigned across revisions, so compare rendered content independent of those IDs.
     let mut primitives = Vec::with_capacity(list.prims.len());
+    let mut by_kind: BTreeMap<&str, Vec<[u8; 32]>> = BTreeMap::new();
     for prim in &list.prims {
         let mut fingerprint = Sha256::new();
         fingerprint.update([prim.color.0, prim.color.1, prim.color.2, prim.transparency]);
         fingerprint.update([u8::from(prim.aci7)]);
         fingerprint.update(prim.lw.to_bits().to_le_bytes());
         fingerprint.update(prim.len.to_le_bytes());
+        let (kind_name, kind_code) = match prim.kind {
+            cadcraft_render::Kind::Polyline => ("Polyline", 0),
+            cadcraft_render::Kind::Tris => ("Tris", 1),
+            cadcraft_render::Kind::Mask => ("Mask", 2),
+            cadcraft_render::Kind::Point => ("Point", 3),
+            cadcraft_render::Kind::Infinite { ray } => ("Infinite", 4 + u8::from(ray)),
+            cadcraft_render::Kind::Image { .. } => ("Image", 6),
+        };
         match prim.kind {
-            cadcraft_render::Kind::Polyline => fingerprint.update([0]),
-            cadcraft_render::Kind::Tris => fingerprint.update([1]),
-            cadcraft_render::Kind::Mask => fingerprint.update([2]),
-            cadcraft_render::Kind::Point => fingerprint.update([3]),
+            cadcraft_render::Kind::Polyline => fingerprint.update([kind_code]),
+            cadcraft_render::Kind::Tris => fingerprint.update([kind_code]),
+            cadcraft_render::Kind::Mask => fingerprint.update([kind_code]),
+            cadcraft_render::Kind::Point => fingerprint.update([kind_code]),
             cadcraft_render::Kind::Infinite { ray } => fingerprint.update([4, u8::from(ray)]),
             cadcraft_render::Kind::Image { index } => {
-                fingerprint.update([5]);
+                fingerprint.update([kind_code]);
                 let image = &list.images[index as usize];
                 fingerprint.update(image.raster.width().to_le_bytes());
                 fingerprint.update(image.raster.height().to_le_bytes());
@@ -121,6 +140,16 @@ fn main() {
         let mut primitive = [0; 32];
         primitive.copy_from_slice(&fingerprint.finalize());
         primitives.push(primitive);
+        by_kind.entry(kind_name).or_default().push(primitive);
+    }
+    for (kind, mut fingerprints) in by_kind {
+        fingerprints.sort_unstable();
+        let mut kind_digest = Sha256::new();
+        for fingerprint in &fingerprints {
+            kind_digest.update(fingerprint);
+        }
+        println!("CRAFT_KIND_{kind}_COUNT={}", fingerprints.len());
+        println!("CRAFT_KIND_{kind}_SHA256={:x}", kind_digest.finalize());
     }
     primitives.sort_unstable();
     let mut digest = Sha256::new();
