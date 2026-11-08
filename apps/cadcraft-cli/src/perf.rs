@@ -178,19 +178,34 @@ fn perf_file(path: &std::path::Path, io: &mut Streams) -> Result {
             finest = screen;
         }
     }
-    // A representative single-entity property edit in a fit-to-drawing view. Journey mode skips
-    // the unrelated zoom sweep and plot build so only the requested edit contributes work.
+    // Edit the most geometrically complex visible hatch when the drawing has one. Journey mode
+    // skips the unrelated zoom sweep and plot build so only the requested edit contributes work.
     // The timing excludes file open and initial cache population.
     // The real-file journey matches a fit-to-drawing view; the open-DXF probe keeps its zoomed-in
     // diagnostic measurement.
     let edit_opts = if edit_mode.is_some() { &zoom_extents } else { &finest };
     let edited_handle = d.space(space).and_then(|store| {
-        store
+        let complex_hatch = store
             .iter()
-            .find(|entity| matches!(entity.kind, cadcraft_engine::doc::EntityKind::Line(_)) && entity.common.visible)
-            .or_else(|| store.iter().find(|entity| matches!(entity.kind, cadcraft_engine::doc::EntityKind::Hatch(_))))
-            .or_else(|| store.iter().last())
-            .map(|entity| entity.handle)
+            .filter_map(|entity| {
+                if !entity.common.visible {
+                    return None;
+                }
+                let cadcraft_engine::doc::EntityKind::Hatch(hatch) = &entity.kind else { return None };
+                let complexity =
+                    hatch.loops.iter().fold(0usize, |sum, loop_| sum.saturating_add(loop_.vertices.len())).saturating_add(hatch.pattern_lines.len());
+                Some((entity.handle, complexity))
+            })
+            .max_by_key(|(_, complexity)| *complexity)
+            .map(|(handle, _)| handle);
+        complex_hatch
+            .or_else(|| {
+                store
+                    .iter()
+                    .find(|entity| matches!(entity.kind, cadcraft_engine::doc::EntityKind::Line(_)) && entity.common.visible)
+                    .map(|entity| entity.handle)
+            })
+            .or_else(|| store.iter().last().map(|entity| entity.handle))
     });
     if let Some(handle) = edited_handle {
         let incremental_mode = edit_mode.as_deref() == Some("incremental");
