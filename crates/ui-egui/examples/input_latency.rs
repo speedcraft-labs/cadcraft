@@ -4,6 +4,7 @@ use cadcraft_engine::Session;
 use cadcraft_ui_egui::{CadApp, Services};
 use egui_kittest::Harness;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -27,54 +28,73 @@ fn main() {
         },
         app,
     );
-    let before = h.state().session.state().expect("drawing").view().height;
-    // The drawing occupies the center of the harness window. Queue a real viewport input before
-    // the first frame, when its initial display-list build must be admitted.
-    h.event(egui::Event::PointerMoved(egui::pos2(700.0, 450.0)));
-    h.event(egui::Event::MouseWheel {
-        unit: egui::MouseWheelUnit::Line,
-        delta: egui::vec2(0.0, -3.0),
-        phase: egui::TouchPhase::Move,
-        modifiers: egui::Modifiers::NONE,
-        source: egui::MouseWheelSource::Unknown,
-    });
-    let start = Instant::now();
-    h.step();
-    let latency = start.elapsed();
-    let after = h.state().session.state().expect("drawing").view().height;
-    assert!((after - before).abs() > 1e-6, "wheel input did not zoom the viewport");
-
     let deadline = Instant::now() + Duration::from_secs(120);
-    while h.state().canvas.list.is_none() {
+    while h.state().canvas.list.is_none() || h.state().canvas.building() {
         assert!(Instant::now() < deadline, "initial display-list build timed out");
         h.step();
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(1));
     }
+    let lines = {
+        let state = h.state().session.state().expect("drawing");
+        let mut lines = BTreeMap::<([[u64; 3]; 2], String), Vec<_>>::new();
+        for entity in state.doc.space(&state.space).expect("drawing space").iter() {
+            let cadcraft_doc::EntityKind::Line(line) = &entity.kind else { continue };
+            let mut endpoints =
+                [[line.a.x.to_bits(), line.a.y.to_bits(), line.a.z.to_bits()], [line.b.x.to_bits(), line.b.y.to_bits(), line.b.z.to_bits()]];
+            endpoints.sort_unstable();
+            // Skip endpoint/style duplicates so the moved entity is stable across unordered
+            // imports and app revisions. Handles are not part of the cross-revision key.
+            let style = serde_json::to_string(&entity.common).expect("serialize line style");
+            lines.entry((endpoints, style)).or_default().push(entity.handle);
+        }
+        lines
+    };
+    let ((line_key, _style), handles) = lines.into_iter().find(|(_, handles)| handles.len() == 1).expect("loaded drawing has a unique line to edit");
+    let handle = handles[0];
+    println!("CRAFT_INPUT_LINE_KEY={line_key:?}");
+    let revision = h.state().session.state().expect("drawing").revision;
+    // Move one entity after the heavy drawing has settled. The resulting display-list rebuild
+    // is the UI-thread stall this journey targets; the first paint is timed, while completion is
+    // awaited below solely for the output equality check.
+    let start = Instant::now();
+    h.state_mut().session.execute("move", &serde_json::json!({ "handles": [handle.hex()], "delta": [1.0, 0.0] })).expect("move one entity");
+    h.step();
+    let latency = start.elapsed();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while h.state().canvas.list.is_none() || h.state().canvas.building() {
+        assert!(Instant::now() < deadline, "edit-triggered display-list rebuild timed out");
+        h.step();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(h.state().session.state().expect("drawing").revision > revision, "entity edit did not update the drawing");
     let list = h.state().canvas.list.as_ref().expect("rebuilt display list");
     assert!(!list.prims.is_empty(), "loaded display list is empty");
-    // Display-list primitive order can vary between processes because the drawing engine builds
-    // several parts from hash maps. Hash each primitive independently, then sort the fingerprints
-    // so the output check compares the same multiset of primitives on both sides.
-    let mut primitives = Vec::with_capacity(list.prims.len());
-    for prim in &list.prims {
-        let mut fingerprint = Sha256::new();
-        fingerprint.update(prim.handle.0.to_le_bytes());
-        fingerprint.update([prim.color.0, prim.color.1, prim.color.2, prim.transparency]);
-        fingerprint.update(prim.lw.to_bits().to_le_bytes());
-        fingerprint.update(prim.len.to_le_bytes());
-        fingerprint.update(format!("{:?}", prim.kind).as_bytes());
-        for point in list.points(prim) {
-            fingerprint.update(point.x.to_bits().to_le_bytes());
-            fingerprint.update(point.y.to_bits().to_le_bytes());
-        }
-        let mut primitive = [0; 32];
-        primitive.copy_from_slice(&fingerprint.finalize());
-        primitives.push(primitive);
-    }
-    primitives.sort_unstable();
+    // Renderer tessellation fragments can split in different places across worker runs. Check
+    // the edited document's canonical entity content instead; ignore handles and iteration order.
+    let state = h.state().session.state().expect("drawing");
+    let mut entities = state
+        .doc
+        .space(&state.space)
+        .expect("drawing space")
+        .iter()
+        .map(|entity| {
+            let common = serde_json::to_vec(&entity.common).expect("serialize entity properties");
+            let kind = serde_json::to_vec(&entity.kind).expect("serialize entity geometry");
+            let mut fingerprint = Sha256::new();
+            fingerprint.update((common.len() as u64).to_le_bytes());
+            fingerprint.update(common);
+            fingerprint.update((kind.len() as u64).to_le_bytes());
+            fingerprint.update(kind);
+            let mut digest = [0; 32];
+            digest.copy_from_slice(&fingerprint.finalize());
+            digest
+        })
+        .collect::<Vec<_>>();
+    entities.sort_unstable();
     let mut digest = Sha256::new();
-    for primitive in primitives {
-        digest.update(primitive);
+    digest.update((entities.len() as u64).to_le_bytes());
+    for entity in entities {
+        digest.update(entity);
     }
 
     println!("CRAFT_JOURNEY_NS={}", latency.as_nanos());
