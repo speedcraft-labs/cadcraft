@@ -27,30 +27,37 @@ fn main() {
         },
         app,
     );
-    let before = h.state().session.state().expect("drawing").view().height;
-    // The drawing occupies the center of the harness window. Queue a real viewport input before
-    // the first frame, when its initial display-list build must be admitted.
-    h.event(egui::Event::PointerMoved(egui::pos2(700.0, 450.0)));
-    h.event(egui::Event::MouseWheel {
-        unit: egui::MouseWheelUnit::Line,
-        delta: egui::vec2(0.0, -3.0),
-        phase: egui::TouchPhase::Move,
-        modifiers: egui::Modifiers::NONE,
-        source: egui::MouseWheelSource::Unknown,
-    });
-    let start = Instant::now();
-    h.step();
-    let latency = start.elapsed();
-    let deadline = start + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_secs(120);
     while h.state().canvas.list.is_none() || h.state().canvas.building() {
-        assert!(Instant::now() < deadline, "input-triggered display-list rebuild timed out");
+        assert!(Instant::now() < deadline, "initial display-list build timed out");
         h.step();
         std::thread::sleep(Duration::from_millis(1));
     }
-    // The timed frame is the first response to input; wait for the final list only for the output
-    // equality check below, outside the latency measurement.
-    let after = h.state().session.state().expect("drawing").view().height;
-    assert!((after - before).abs() > 1e-6, "wheel input did not zoom the viewport");
+    let handle = h
+        .state()
+        .session
+        .state()
+        .expect("drawing")
+        .doc
+        .space(&h.state().session.state().expect("drawing").space)
+        .and_then(|space| space.iter().find(|entity| matches!(&entity.kind, cadcraft_doc::EntityKind::Line(_))))
+        .map(|entity| entity.handle)
+        .expect("loaded drawing has a line to edit");
+    let revision = h.state().session.state().expect("drawing").revision;
+    // Move one entity after the heavy drawing has settled. The resulting display-list rebuild
+    // is the UI-thread stall this journey targets; the first paint is timed, while completion is
+    // awaited below solely for the output equality check.
+    let start = Instant::now();
+    h.state_mut().session.execute("move", &serde_json::json!({ "handles": [handle.hex()], "delta": [1.0, 0.0] })).expect("move one entity");
+    h.step();
+    let latency = start.elapsed();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while h.state().canvas.list.is_none() || h.state().canvas.building() {
+        assert!(Instant::now() < deadline, "edit-triggered display-list rebuild timed out");
+        h.step();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(h.state().session.state().expect("drawing").revision > revision, "entity edit did not update the drawing");
     let list = h.state().canvas.list.as_ref().expect("rebuilt display list");
     assert!(!list.prims.is_empty(), "loaded display list is empty");
     // Display-list primitive order and raster-image indices can vary across processes because
