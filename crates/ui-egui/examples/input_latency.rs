@@ -34,27 +34,23 @@ fn main() {
         h.step();
         std::thread::sleep(Duration::from_millis(1));
     }
-    let mut lines = {
+    let lines = {
         let state = h.state().session.state().expect("drawing");
-        state
-            .doc
-            .space(&state.space)
-            .expect("drawing space")
-            .iter()
-            .filter_map(|entity| {
-                let cadcraft_doc::EntityKind::Line(line) = &entity.kind else { return None };
-                let mut endpoints =
-                    [[line.a.x.to_bits(), line.a.y.to_bits(), line.a.z.to_bits()], [line.b.x.to_bits(), line.b.y.to_bits(), line.b.z.to_bits()]];
-                endpoints.sort_unstable();
-                // Endpoint duplicates occur in this drawing. Break those ties with the full
-                // visual properties, not iteration order or app-assigned object handles.
-                let style = serde_json::to_string(&entity.common).expect("serialize line style");
-                Some((endpoints, style, entity.handle))
-            })
-            .collect::<Vec<_>>()
+        let mut lines = BTreeMap::<([[u64; 3]; 2], String), Vec<_>>::new();
+        for entity in state.doc.space(&state.space).expect("drawing space").iter() {
+            let cadcraft_doc::EntityKind::Line(line) = &entity.kind else { continue };
+            let mut endpoints =
+                [[line.a.x.to_bits(), line.a.y.to_bits(), line.a.z.to_bits()], [line.b.x.to_bits(), line.b.y.to_bits(), line.b.z.to_bits()]];
+            endpoints.sort_unstable();
+            // Skip endpoint/style duplicates so the moved entity is stable across unordered
+            // imports and app revisions. Handles are not part of the cross-revision key.
+            let style = serde_json::to_string(&entity.common).expect("serialize line style");
+            lines.entry((endpoints, style)).or_default().push(entity.handle);
+        }
+        lines
     };
-    lines.sort_unstable_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-    let (line_key, _style, handle) = lines.into_iter().next().expect("loaded drawing has a line to edit");
+    let ((line_key, _style), handles) = lines.into_iter().find(|(_, handles)| handles.len() == 1).expect("loaded drawing has a unique line to edit");
+    let handle = handles[0];
     println!("CRAFT_INPUT_LINE_KEY={line_key:?}");
     let revision = h.state().session.state().expect("drawing").revision;
     // Move one entity after the heavy drawing has settled. The resulting display-list rebuild
@@ -73,91 +69,32 @@ fn main() {
     assert!(h.state().session.state().expect("drawing").revision > revision, "entity edit did not update the drawing");
     let list = h.state().canvas.list.as_ref().expect("rebuilt display list");
     assert!(!list.prims.is_empty(), "loaded display list is empty");
-    // Display-list primitive order and raster-image indices can vary across processes because
-    // the drawing engine builds several parts from hash maps. Object handles can also be
-    // reassigned across revisions, so compare rendered content independent of those IDs.
-    let mut primitives = Vec::with_capacity(list.prims.len());
-    let mut by_kind: BTreeMap<&str, Vec<[u8; 32]>> = BTreeMap::new();
-    for prim in &list.prims {
-        let mut fingerprint = Sha256::new();
-        fingerprint.update([prim.color.0, prim.color.1, prim.color.2, prim.transparency]);
-        fingerprint.update([u8::from(prim.aci7)]);
-        fingerprint.update(prim.lw.to_bits().to_le_bytes());
-        fingerprint.update(prim.len.to_le_bytes());
-        let (kind_name, kind_code) = match prim.kind {
-            cadcraft_render::Kind::Polyline => ("Polyline", 0),
-            cadcraft_render::Kind::Tris => ("Tris", 1),
-            cadcraft_render::Kind::Mask => ("Mask", 2),
-            cadcraft_render::Kind::Point => ("Point", 3),
-            cadcraft_render::Kind::Infinite { ray } => ("Infinite", 4 + u8::from(ray)),
-            cadcraft_render::Kind::Image { .. } => ("Image", 6),
-        };
-        match prim.kind {
-            cadcraft_render::Kind::Polyline => fingerprint.update([kind_code]),
-            cadcraft_render::Kind::Tris => fingerprint.update([kind_code]),
-            cadcraft_render::Kind::Mask => fingerprint.update([kind_code]),
-            cadcraft_render::Kind::Point => fingerprint.update([kind_code]),
-            cadcraft_render::Kind::Infinite { ray } => fingerprint.update([4, u8::from(ray)]),
-            cadcraft_render::Kind::Image { index } => {
-                fingerprint.update([kind_code]);
-                let image = &list.images[index as usize];
-                fingerprint.update(image.raster.width().to_le_bytes());
-                fingerprint.update(image.raster.height().to_le_bytes());
-                fingerprint.update(image.raster.rgba());
-                fingerprint.update([image.fade]);
-                fingerprint.update((image.clips.len() as u64).to_le_bytes());
-                for clip in &image.clips {
-                    fingerprint.update((clip.len() as u64).to_le_bytes());
-                    for point in clip {
-                        fingerprint.update(point.x.to_bits().to_le_bytes());
-                        fingerprint.update(point.y.to_bits().to_le_bytes());
-                    }
-                }
-            }
-        }
-        let points = list.points(prim);
-        if matches!(prim.kind, cadcraft_render::Kind::Tris | cadcraft_render::Kind::Mask) {
-            // Triangle order and winding have no effect on the filled output, but hatch
-            // tessellation may emit them in a different order across processes.
-            let mut triangles = points
-                .chunks_exact(3)
-                .map(|triangle| {
-                    let mut vertices: [(u64, u64); 3] = std::array::from_fn(|i| (triangle[i].x.to_bits(), triangle[i].y.to_bits()));
-                    vertices.sort_unstable();
-                    vertices
-                })
-                .collect::<Vec<_>>();
-            triangles.sort_unstable();
-            for triangle in triangles {
-                for (x, y) in triangle {
-                    fingerprint.update(x.to_le_bytes());
-                    fingerprint.update(y.to_le_bytes());
-                }
-            }
-        } else {
-            for point in points {
-                fingerprint.update(point.x.to_bits().to_le_bytes());
-                fingerprint.update(point.y.to_bits().to_le_bytes());
-            }
-        }
-        let mut primitive = [0; 32];
-        primitive.copy_from_slice(&fingerprint.finalize());
-        primitives.push(primitive);
-        by_kind.entry(kind_name).or_default().push(primitive);
-    }
-    for (kind, mut fingerprints) in by_kind {
-        fingerprints.sort_unstable();
-        let mut kind_digest = Sha256::new();
-        for fingerprint in &fingerprints {
-            kind_digest.update(fingerprint);
-        }
-        println!("CRAFT_KIND_{kind}_COUNT={}", fingerprints.len());
-        println!("CRAFT_KIND_{kind}_SHA256={:x}", kind_digest.finalize());
-    }
-    primitives.sort_unstable();
+    // Renderer tessellation fragments can split in different places across worker runs. Check
+    // the edited document's canonical entity content instead; ignore handles and iteration order.
+    let state = h.state().session.state().expect("drawing");
+    let mut entities = state
+        .doc
+        .space(&state.space)
+        .expect("drawing space")
+        .iter()
+        .map(|entity| {
+            let common = serde_json::to_vec(&entity.common).expect("serialize entity properties");
+            let kind = serde_json::to_vec(&entity.kind).expect("serialize entity geometry");
+            let mut fingerprint = Sha256::new();
+            fingerprint.update((common.len() as u64).to_le_bytes());
+            fingerprint.update(common);
+            fingerprint.update((kind.len() as u64).to_le_bytes());
+            fingerprint.update(kind);
+            let mut digest = [0; 32];
+            digest.copy_from_slice(&fingerprint.finalize());
+            digest
+        })
+        .collect::<Vec<_>>();
+    entities.sort_unstable();
     let mut digest = Sha256::new();
-    for primitive in primitives {
-        digest.update(primitive);
+    digest.update((entities.len() as u64).to_le_bytes());
+    for entity in entities {
+        digest.update(entity);
     }
 
     println!("CRAFT_JOURNEY_NS={}", latency.as_nanos());
