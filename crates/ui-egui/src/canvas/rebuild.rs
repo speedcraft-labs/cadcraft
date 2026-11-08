@@ -1,25 +1,23 @@
-//! Display-list rebuilds that only follow the view run on a worker thread, as AutoCAD redraws
-//! instead of regenerating while you zoom and pan.
+//! Initial display-list builds, edits and view changes run on workers so rebuilding never holds
+//! up the UI frame.
 //!
-//! Zooming past a 2x tessellation band or panning out of the area the list was built for used to
-//! rebuild the list (and convert it to GPU vertex data) on the UI thread: on a hatched 12k-entity
-//! drawing each step froze the window for 2-3 s. The current list stays valid at any view (only
-//! hatch patterns are limited to its area, and curves and dashes are a band coarser or finer than
-//! ideal), so the canvas keeps drawing it, scaled and moved by the view uniform, while the worker
-//! builds the new one. A view that needs a different list cancels the build in flight (dropping
-//! its [`Job`] sets the build's cancel flag, see `cadcraft_render::Options::cancel`) and starts
-//! one for itself, so a long scroll through many zoom bands builds only for where it stops.
-//! Edits still rebuild at once, so a change is never drawn late. The web build has no threads and
-//! rebuilds synchronously.
+//! The canvas keeps drawing its current list while a worker builds a replacement. This covers
+//! the first list, document edits and view changes, so a large drawing doesn't hold up the input
+//! frame that opened or changed it. A new build for the same view cancels the one in flight
+//! (dropping its [`Job`] sets the renderer's cancel flag) and starts one for the latest state.
+//! The web build has no threads and rebuilds synchronously.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::OnceLock;
 
 use cadcraft_color::Rgb;
 use cadcraft_doc::{Drawing, Space};
 use cadcraft_geom::{Bounds2, Vec2};
 use cadcraft_render::{DisplayList, Kind, Options};
+use craft_jobs::{JobEvent, JobHandle};
+#[cfg(not(target_arch = "wasm32"))]
+use craft_jobs::{JobSystem, Priority};
 
 /// What a build needs: the drawing (shared, never copied), the space and the options.
 pub(super) struct Request {
@@ -65,14 +63,7 @@ pub(super) struct BuiltMesh {
 pub(super) struct Job {
     pub key: super::ListKey,
     pub window: Option<Bounds2>,
-    rx: Receiver<Built>,
-    cancel: Arc<AtomicBool>,
-}
-
-impl Drop for Job {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
-    }
+    handle: JobHandle<Built>,
 }
 
 /// What [`Job::poll`] found.
@@ -85,10 +76,10 @@ pub(super) enum Poll {
 
 impl Job {
     pub fn poll(&self) -> Poll {
-        match self.rx.try_recv() {
-            Ok(b) => Poll::Done(Box::new(b)),
-            Err(TryRecvError::Empty) => Poll::Pending,
-            Err(TryRecvError::Disconnected) => Poll::Lost,
+        match self.handle.try_recv() {
+            Ok(JobEvent::Progress(_)) | Err(std::sync::mpsc::TryRecvError::Empty) => Poll::Pending,
+            Ok(JobEvent::Completed(Ok(built))) => Poll::Done(Box::new(built)),
+            Ok(JobEvent::Completed(Err(_))) | Err(std::sync::mpsc::TryRecvError::Disconnected) => Poll::Lost,
         }
     }
 
@@ -128,36 +119,37 @@ fn run(req: Request) -> Option<Built> {
 }
 
 /// Start building `req` on a worker thread for `key` / `window`; the worker asks `ctx` for a
-/// frame when it is done. `None` when there are no threads (the web build) or none could be
-/// started: the caller builds synchronously.
+/// frame when it is done. `None` when no native worker could be started; the caller keeps its
+/// current list. The wasm path calls the synchronous renderer directly.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn spawn(mut req: Request, key: super::ListKey, window: Option<Bounds2>, ctx: &egui::Context) -> Option<Job> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let cancel = Arc::new(AtomicBool::new(false));
-    req.opts.cancel = Some(cancel.clone());
+    static JOBS: OnceLock<JobSystem> = OnceLock::new();
+    let jobs = JOBS.get_or_init(|| JobSystem::new(2));
+    if !jobs.is_available() {
+        log::warn!("canvas: no craft-jobs worker could be started; keeping the current display list");
+        return None;
+    }
     let ctx = ctx.clone();
-    let spawned = std::thread::Builder::new().name("cadcraft-regen".into()).spawn(move || {
-        // A panic drops `tx` unsent: the canvas sees the job as lost and builds on its own. A
-        // cancelled build sends nothing either, but its job is gone and nobody is listening.
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(req))) {
-            Ok(None) => {}
+    // Each canvas owns its handle and cancels its own previous build when it changes view.
+    // A document key is not enough here: separate windows can open the same drawing and each
+    // needs an independent result (and repaint target).
+    let handle = jobs.submit(Priority::Interactive, move |job_ctx| {
+        req.opts.cancel = Some(job_ctx.cancellation().atomic_flag());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(req)));
+        match result {
             Ok(Some(built)) => {
-                let _ = tx.send(built);
                 ctx.request_repaint();
+                job_ctx.report_progress(100);
+                Ok(built)
             }
+            Ok(None) => Err(craft_jobs::JobError::Cancelled),
             Err(_) => {
-                drop(tx);
                 ctx.request_repaint();
+                Err(craft_jobs::JobError::Failed("display-list build panicked".into()))
             }
         }
     });
-    match spawned {
-        Ok(_) => Some(Job { key, window, rx, cancel }),
-        Err(e) => {
-            log::warn!("canvas: could not start a regen thread ({e}); rebuilding on the UI thread");
-            None
-        }
-    }
+    Some(Job { key, window, handle })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -168,6 +160,7 @@ pub(super) fn spawn(_req: Request, _key: super::ListKey, _window: Option<Bounds2
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn worker_build_matches_a_synchronous_one() {
@@ -215,10 +208,15 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_job_cancels_its_build() {
-        let (_tx, rx) = std::sync::mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        drop(Job { key: Default::default(), window: None, rx, cancel: cancel.clone() });
-        assert!(cancel.load(Ordering::Relaxed));
+    fn dropping_a_job_handle_requests_cancellation() {
+        let jobs = JobSystem::new(1);
+        let (token_tx, token_rx) = std::sync::mpsc::channel();
+        let handle = jobs.submit(Priority::Interactive, move |ctx| {
+            token_tx.send(ctx.cancellation()).ok();
+            Ok(())
+        });
+        let token = token_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("worker should start");
+        drop(handle);
+        assert!(token.is_cancelled());
     }
 }

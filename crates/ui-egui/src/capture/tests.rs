@@ -347,7 +347,9 @@ fn a_discarded_pass_does_not_issue_and_the_settled_pass_does_once() {
     let mut app = app();
     let (rx, _) = admit_one(&mut app, &ctx);
     for shot in &mut app.shots.requests {
-        shot.ready_at = Instant::now() - Duration::from_millis(1);
+        // The empty drawing may still have its initial worker build in flight. The settled
+        // screenshot pass should start after that rebuild's admission window too.
+        shot.ready_at = Instant::now() - REBUILD_WAIT - Duration::from_millis(1);
         shot.frames = SETTLE_PASSES - 1;
     }
     let raw = raw(800.0, 600.0);
@@ -453,7 +455,9 @@ fn a_resize_while_settling_is_absorbed_at_issue() {
     let mut app = app();
     let (rx, _) = admit_one(&mut app, &ctx);
     for shot in &mut app.shots.requests {
-        shot.ready_at = Instant::now() - Duration::from_millis(1);
+        // The initial display list is now built asynchronously, so the settling window also
+        // accounts for an in-flight worker rebuild.
+        shot.ready_at = Instant::now() - REBUILD_WAIT - Duration::from_millis(1);
     }
     ui_frame_sized(&mut app, &ctx, 900.0, 600.0).drop_without_applying_deltas();
     ui_frame_sized(&mut app, &ctx, 900.0, 600.0).drop_without_applying_deltas();

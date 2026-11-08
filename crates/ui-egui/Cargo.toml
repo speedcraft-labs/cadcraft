@@ -10,6 +10,7 @@ rust-version = "1.95"
 workspace = true
 
 [dependencies]
+craft-jobs = { workspace = true }
 craft-ui = { workspace = true }
 cadcraft-geom = { workspace = true }
 cadcraft-color = { workspace = true }
@@ -35,11 +36,13 @@ craft-update = { workspace = true }
 [dev-dependencies]
 # Tests build the dock area as the desktop app does (headless contexts keep floats in-window).
 craft-ui = { workspace = true, features = ["native-windows"] }
+cadcraft-io = { workspace = true }
 # The workspace `egui` dependency enables `default_fonts` and `monochrome_emoji_fonts` in
 # production too; the tests exercise the same installed chain as the app.
 egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
 # Validates the canvas WGSL and its GLSL ES 3.0 (WebGL2) translation in tests (same naga wgpu uses).
 naga = { version = "30", features = ["wgsl-in", "glsl-out"] }
+sha2 = "0.10"
 
 [build-dependencies]
 serde_json = { workspace = true }

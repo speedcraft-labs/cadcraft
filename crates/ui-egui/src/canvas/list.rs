@@ -60,9 +60,8 @@ pub(super) fn rebuilt_preview<'a>(doc: &cadcraft_doc::Drawing, ents: impl IntoIt
 /// Rebuild the display list when needed. `xf`: the current view; `views`: every area on screen
 /// that shows the list (the current view, other model tiles) with its drawing units per pixel.
 ///
-/// A rebuild only the view asks for (a new zoom band, a pan out of the built area) runs in the
-/// background while the current list is drawn (see [`rebuild`]); a changed drawing, or no list
-/// yet, is built at once.
+/// Rebuilds for a new drawing, first view, zoom band or pan run in the background while the
+/// current list is drawn (see [`rebuild`]).
 /// The font set text is drawn with: TrueType fonts (font folders, rescans) and SHX fonts
 /// (drawing folders, font folders, the search path) can each change what text looks like. Every
 /// cache of drawn geometry keys on it.
@@ -113,12 +112,12 @@ pub(super) fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], c
             rebuild::Poll::Done(built) => {
                 let (job_key, window) = (job.key, job.window);
                 app.canvas.job = None;
-                if app.canvas.list.is_some() && same_content(&job_key, &key) {
+                if same_content(&job_key, &key) {
                     app.canvas.install(job_key, window, *built);
                 }
             }
             rebuild::Poll::Lost => {
-                log::warn!("canvas: a background rebuild failed; rebuilding on the UI thread");
+                log::warn!("canvas: a background rebuild failed; queuing a replacement");
                 app.canvas.job = None;
                 app.canvas.list = None;
             }
@@ -129,14 +128,16 @@ pub(super) fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], c
     if app.canvas.list.is_some() && app.canvas.key == key && inside {
         return;
     }
-    // Only the view moved: keep drawing the current list and build the new one in the background.
-    let view_only = app.canvas.list.is_some() && same_content(&app.canvas.key, &key);
-    if view_only && app.canvas.job.as_ref().is_some_and(|j| j.serves(&key, &visible)) {
+    // Keep drawing the current list while the replacement is built in the background. This also
+    // covers a changed drawing or its first list: edits must not force a large rebuild into the
+    // input frame that made them.
+    if app.canvas.job.as_ref().is_some_and(|j| j.serves(&key, &visible)) {
         return;
     }
     // A build for another view, or for a drawing that has since changed, is no longer wanted:
     // dropping it cancels it.
     app.canvas.job = None;
+    #[cfg(target_arch = "wasm32")]
     let t0 = crate::now_ms();
     let opts = cadcraft_render::Options {
         tolerance: 2f64.powi(band(px)) * 0.5,
@@ -154,29 +155,38 @@ pub(super) fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], c
         skip_viewport: split,
         cancel: None,
     };
-    if view_only {
-        let t = Tokens::get();
-        let mesh = app.canvas.gpu.is_some().then(|| rebuild::MeshRequest {
-            view_center: xf.center,
-            view_height: f64::from(xf.rect.height()) / xf.scale.max(1e-300),
-            model_bg: Rgb(t.canvas.r(), t.canvas.g(), t.canvas.b()),
-            paper_bg: Rgb(t.paper.r(), t.paper.g(), t.paper.b()),
-            lwdisplay,
-            device: app.canvas.gpu_device.clone(),
-        });
-        let window = opts.view;
-        let req = rebuild::Request { doc: st.doc.clone(), space: st.space.clone(), opts: opts.clone(), mesh };
-        if let Some(job) = rebuild::spawn(req, key, window, ctx) {
-            app.canvas.job = Some(job);
-            return;
-        }
+    let t = Tokens::get();
+    let mesh = app.canvas.gpu.is_some().then(|| rebuild::MeshRequest {
+        view_center: xf.center,
+        view_height: f64::from(xf.rect.height()) / xf.scale.max(1e-300),
+        model_bg: Rgb(t.canvas.r(), t.canvas.g(), t.canvas.b()),
+        paper_bg: Rgb(t.paper.r(), t.paper.g(), t.paper.b()),
+        lwdisplay,
+        device: app.canvas.gpu_device.clone(),
+    });
+    let window = opts.view;
+    let req = rebuild::Request { doc: st.doc.clone(), space: st.space.clone(), opts: opts.clone(), mesh };
+    if let Some(job) = rebuild::spawn(req, key, window, ctx) {
+        app.canvas.job = Some(job);
+        return;
     }
-    let space = st.space.clone();
-    app.canvas.list = Some(cadcraft_render::build_cached(&st.doc, &space, &opts, &mut app.canvas.entity_display_cache));
-    app.canvas.key = key;
-    app.canvas.window = opts.view;
-    app.canvas.list_gen = app.canvas.list_gen.wrapping_add(1);
-    app.canvas.build_ms = crate::now_ms() - t0;
+
+    // Browser builds have no worker threads. Keep their previous synchronous path. Native
+    // builds do not fall back to a synchronous rebuild if worker startup failed: keeping the
+    // existing list (or an empty canvas on first open) is preferable to blocking input.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        log::warn!("canvas: display-list rebuild was not queued; keeping the current list");
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let space = st.space.clone();
+        app.canvas.list = Some(cadcraft_render::build_cached(&st.doc, &space, &opts, &mut app.canvas.entity_display_cache));
+        app.canvas.key = key;
+        app.canvas.window = opts.view;
+        app.canvas.list_gen = app.canvas.list_gen.wrapping_add(1);
+        app.canvas.build_ms = crate::now_ms() - t0;
+    }
 }
 
 /// The display list of what a running command shows in place of the drawing

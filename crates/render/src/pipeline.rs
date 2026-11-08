@@ -87,10 +87,14 @@ pub fn build_cached(d: &Drawing, space: &Space, opts: &Options, cache: &mut Enti
             if needs_build { Some((*entity).clone()) } else { None }
         })
         .collect();
+    #[cfg(not(target_arch = "wasm32"))]
     let refreshed: Vec<_> = {
         use rayon::prelude::*;
         stale.par_iter().map(|entity| (entity.handle, entity.clone(), build_entities(d, std::iter::once(entity.as_ref()), opts))).collect()
     };
+    #[cfg(target_arch = "wasm32")]
+    let refreshed: Vec<_> =
+        stale.iter().map(|entity| (entity.handle, entity.clone(), build_entities(d, std::iter::once(entity.as_ref()), opts))).collect();
     for (handle, entity, fragment) in refreshed {
         cache.fragments.insert(handle, (entity, fragment));
     }
