@@ -802,10 +802,8 @@ dependencies = [
  "cadcraft-engine",
  "cadcraft-fonts",
  "cadcraft-geom",
- "cadcraft-io",
  "cadcraft-render",
  "chrono",
- "craft-jobs",
  "craft-ui",
  "craft-update",
  "craft-window",
@@ -818,7 +816,6 @@ dependencies = [
  "naga",
  "serde",
  "serde_json",
- "sha2",
  "toml",
  "web-time",
 ]
@@ -1176,11 +1173,6 @@ dependencies = [
  "windows-registry",
  "writeable",
 ]
-
-[[package]]
-name = "craft-jobs"
-version = "0.1.0"
-source = "git+https://github.com/speedcraft-labs/craft-libs?rev=f1162559687ebdd91ba4a829483cb79e8bf490aa#f1162559687ebdd91ba4a829483cb79e8bf490aa"
 
 [[package]]
 name = "craft-pdf"
