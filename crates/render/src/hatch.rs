@@ -500,6 +500,10 @@ impl Family<'_> {
         if k1.saturating_sub(k0) > max_lines {
             return;
         }
+        if out.len() >= MAX_RUNS || *work == 0 || is_set(cancel) {
+            return;
+        }
+        let mut edges = CrossingTable::new(&local);
         let pat_len: f64 = self.dashes.iter().map(|d| d.abs()).sum();
         // Level of detail: a whole repeat under two pixels reads as a continuous line (when the
         // family draws anything at all).
@@ -510,7 +514,7 @@ impl Family<'_> {
                 return;
             }
             let y = k as f64 * self.spacing;
-            let xs = crossings(&local, y);
+            let xs = edges.at(y);
             let offset = shift_per_line * k as f64;
             for span in xs.chunks(2) {
                 let [x0, x1] = span else { continue };
@@ -561,7 +565,71 @@ impl Family<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SweepEdge {
+    a: Vec2,
+    b: Vec2,
+    min_y: f64,
+    max_y: f64,
+}
+
+/// Scanline crossings with an active-edge table. Sorted finite-y edges enter once and leave once;
+/// each pattern line intersects only edges that span its y coordinate. Edges with non-finite y
+/// coordinates retain the old predicate in a small fallback list so malformed drawings behave
+/// exactly as before.
+struct CrossingTable {
+    entering: Vec<SweepEdge>,
+    exceptional: Vec<SweepEdge>,
+    next: usize,
+    active: Vec<SweepEdge>,
+    xs: Vec<f64>,
+}
+
+impl CrossingTable {
+    fn new(local: &[Vec<Vec2>]) -> Self {
+        let mut entering = Vec::new();
+        let mut exceptional = Vec::new();
+        for l in local {
+            let n = l.len();
+            for i in 0..n {
+                let (Some(&a), Some(&b)) = (l.get(i), l.get((i + 1) % n)) else { continue };
+                let edge = SweepEdge { a, b, min_y: a.y.min(b.y), max_y: a.y.max(b.y) };
+                if a.y.is_finite() && b.y.is_finite() {
+                    entering.push(edge);
+                } else {
+                    exceptional.push(edge);
+                }
+            }
+        }
+        entering.sort_by(|a, b| a.min_y.total_cmp(&b.min_y));
+        Self { entering, exceptional, next: 0, active: Vec::new(), xs: Vec::new() }
+    }
+
+    fn at(&mut self, y: f64) -> &[f64] {
+        self.active.retain(|edge| edge.max_y > y);
+        while let Some(edge) = self.entering.get(self.next).copied() {
+            if edge.min_y > y {
+                break;
+            }
+            self.next += 1;
+            if edge.max_y > y {
+                self.active.push(edge);
+            }
+        }
+
+        self.xs.clear();
+        for edge in self.active.iter().chain(&self.exceptional) {
+            if (edge.a.y > y) != (edge.b.y > y) {
+                self.xs.push(edge.a.x + (edge.b.x - edge.a.x) * (y - edge.a.y) / (edge.b.y - edge.a.y));
+            }
+        }
+        self.xs.sort_by(f64::total_cmp);
+        &self.xs
+    }
+}
+
 /// The x positions where the boundary loops cross the horizontal line at `y`, in order.
+#[cfg(test)]
 fn crossings(local: &[Vec<Vec2>], y: f64) -> Vec<f64> {
     let mut xs: Vec<f64> = Vec::new();
     for l in local {
@@ -575,6 +643,59 @@ fn crossings(local: &[Vec<Vec2>], y: f64) -> Vec<f64> {
     }
     xs.sort_by(f64::total_cmp);
     xs
+}
+
+#[cfg(test)]
+mod crossing_table_tests {
+    use super::*;
+
+    fn assert_matches_naive(local: &[Vec<Vec2>], mut ys: Vec<f64>) {
+        ys.sort_by(f64::total_cmp);
+        ys.dedup_by(|a, b| a.to_bits() == b.to_bits());
+        let mut table = CrossingTable::new(local);
+        for y in ys {
+            let expected: Vec<u64> = crossings(local, y).into_iter().map(f64::to_bits).collect();
+            let actual: Vec<u64> = table.at(y).iter().copied().map(f64::to_bits).collect();
+            assert_eq!(actual, expected, "scanline y={y}");
+        }
+    }
+
+    #[test]
+    fn active_edges_match_full_edge_scan_on_generated_boundaries() {
+        let mut seed = 0x6a09_e667_f3bc_c909_u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 32) % 81) as f64 - 40.0
+        };
+
+        for case in 0..24 {
+            let loop_count = 1 + case % 5;
+            let mut local = Vec::new();
+            for loop_index in 0..loop_count {
+                let vertex_count = 3 + (case * 7 + loop_index * 11) % 14;
+                let points: Vec<Vec2> = (0..vertex_count).map(|_| Vec2::new(next(), next())).collect();
+                local.push(points);
+            }
+
+            let mut ys: Vec<f64> = (-42..=42).map(|y| y as f64 * 0.5).collect();
+            for y in local.iter().flatten().map(|point| point.y) {
+                ys.extend([y - 1e-9, y, y + 1e-9]);
+            }
+            assert_matches_naive(&local, ys);
+        }
+    }
+
+    #[test]
+    fn non_finite_y_edges_keep_the_original_crossing_predicate() {
+        let local = vec![vec![
+            Vec2::new(0.0, f64::NAN),
+            Vec2::new(4.0, 2.0),
+            Vec2::new(8.0, f64::INFINITY),
+            Vec2::new(12.0, -2.0),
+            Vec2::new(16.0, f64::NEG_INFINITY),
+        ]];
+        assert_matches_naive(&local, vec![-3.0, -2.0, 0.0, 2.0, 3.0, f64::INFINITY]);
+    }
 }
 
 #[cfg(test)]
