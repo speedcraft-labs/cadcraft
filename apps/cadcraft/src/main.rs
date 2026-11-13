@@ -331,6 +331,11 @@ fn main() -> eframe::Result {
     };
     // Started for an agent (`--control`): open without taking the user's keyboard focus.
     options.viewport = options.viewport.with_active(!agent);
+    // Keep an agent window behind normal application windows, even when eframe first shows it.
+    #[cfg(target_os = "macos")]
+    if agent {
+        options.viewport = options.viewport.with_window_level(egui::viewport::WindowLevel::AlwaysOnBottom);
+    }
     if let Some(icon) = app_icon() {
         options.viewport = options.viewport.with_icon(icon);
     }
