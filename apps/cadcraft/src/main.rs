@@ -27,6 +27,8 @@ mod native_menu;
 mod sheet;
 mod spacemouse;
 mod system_animations;
+#[cfg(target_os = "macos")]
+mod window_raise;
 mod workspace;
 
 use cadcraft_engine::Session;
@@ -320,12 +322,15 @@ fn main() -> eframe::Result {
         cadcraft_engine::fonts::ttf::set_fallback_fonts(list);
     }
     let surface = cadcraft_ui_egui::gpu::surface_config(vars.vsync, cfg!(all(unix, not(target_os = "macos"))));
+    let agent = control_port.is_some();
     let mut options = eframe::NativeOptions {
         // The crosshair is drawn by the app: present without a queue on Linux/BSD, where X11
         // swapchains hold two frames back under vsync (`CADCRAFT_VSYNC=1` restores vsync).
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration::default().with_surface_config(surface),
         ..window_options(restores_window())
     };
+    // Started for an agent (`--control`): open without taking the user's keyboard focus.
+    options.viewport = options.viewport.with_active(!agent);
     if let Some(icon) = app_icon() {
         options.viewport = options.viewport.with_icon(icon);
     }
@@ -358,9 +363,13 @@ fn main() -> eframe::Result {
     // close request for the window instead, so it asks first, as the close button does.
     #[cfg(target_os = "macos")]
     {
-        options.event_loop_builder = Some(Box::new(|b| {
+        let agent_hook = agent_event_loop(agent);
+        options.event_loop_builder = Some(Box::new(move |b| {
             use winit::platform::macos::EventLoopBuilderExtMacOS;
             b.with_close_requested_on_terminate(true);
+            if let Some(agent_hook) = agent_hook {
+                agent_hook(b);
+            }
         }));
     }
     eframe::run_native(
@@ -368,6 +377,10 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let mut app = CadApp::new(Session::empty(), services());
+            #[cfg(target_os = "macos")]
+            if agent {
+                app.raise_without_focus = Some(window_raise::raise_without_focus);
+            }
             // File dialogs are sheets on macOS: a modal loop inside the event handler crashes the
             // app when the dialog is resized (#1527).
             #[cfg(target_os = "macos")]
@@ -448,6 +461,19 @@ fn main() -> eframe::Result {
             }))
         }),
     )
+}
+
+/// Driven by an agent (`--control`): don't activate the app on launch, so the user's keyboard
+/// focus stays where it is (macOS; winit activates ignoring other apps by default).
+#[cfg(target_os = "macos")]
+fn agent_event_loop(agent: bool) -> Option<eframe::EventLoopBuilderHook> {
+    if agent {
+        return Some(Box::new(|b| {
+            use winit::platform::macos::EventLoopBuilderExtMacOS;
+            b.with_activate_ignoring_other_apps(false);
+        }));
+    }
+    None
 }
 
 #[cfg(test)]
