@@ -46,13 +46,14 @@ rfd = { workspace = true }
 sys-locale = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.5"
 # `title_bar::sync_movable`: AppKit's title-band drag leaves the window still under the row's
 # controls and under floating panels.
 craft-window = { workspace = true }
 muda = { version = "0.21", default-features = false }
 # View ▸ Accessibility ▸ Animation Effects ▸ Use System Setting: the system's Reduce motion
 # (system_animations.rs). Already in Cargo.lock through muda.
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWorkspace", "NSAccessibility"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWorkspace", "NSAccessibility", "NSApplication", "NSWindow"] }
 # The same winit eframe uses (the storytold fork, patched in the workspace): its opt-in that turns
 # AppKit's terminate (Cmd+Q, Dock Quit) into a close request, so unsaved changes are asked about.
 # `rwh_06`: the window handle a file dialog shown as a sheet attaches to (src/sheet.rs).

@@ -308,6 +308,13 @@ fn key_from(name: &str) -> Option<egui::Key> {
 }
 
 pub fn handle(app: &mut CadApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
+    if req.method.starts_with("ui.") && req.method != "ui.focus" {
+        // UI requests need a rendered pass, but must not activate the app for an agent.
+        if let Some(raise_without_focus) = app.raise_without_focus {
+            raise_without_focus();
+        }
+        ctx.request_repaint();
+    }
     let p = &req.params;
     let s = |k: &str| p.get(k).and_then(Value::as_str);
     let f = |k: &str| p.get(k).and_then(Value::as_f64);
@@ -375,6 +382,7 @@ pub fn handle(app: &mut CadApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
         "ui.inspect" => ok(inspect(app, ctx)),
         "ui.elements" => ok(elements(ctx, p)),
         "ui.focus" => {
+            // Explicit request: activate the app and take keyboard focus.
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             ok(Value::Null)
         }
@@ -775,6 +783,29 @@ fn inline_screenshot(img: &image::RgbaImage, token: u64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static RAISES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn raise_without_focus() -> bool {
+        RAISES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
+    #[test]
+    fn ui_requests_raise_without_focus_but_ui_focus_stays_explicit() {
+        let mut app = CadApp::new(cadcraft_engine::Session::empty(), crate::Services::default());
+        app.raise_without_focus = Some(raise_without_focus);
+        let ctx = egui::Context::default();
+        RAISES.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let (req, _reply) = ControlRequest::new("ui.inspect", json!({}));
+        let _ = handle(&mut app, &ctx, &req);
+        assert_eq!(RAISES.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let (req, _reply) = ControlRequest::new("ui.focus", json!({}));
+        let _ = handle(&mut app, &ctx, &req);
+        assert_eq!(RAISES.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn an_inline_screenshot_carries_the_png_and_its_size() {
