@@ -49,17 +49,17 @@ pub(super) fn specs() -> Vec<CommandSpec> {
     ]
 }
 
-/// Load the xrefs of drawing `i`, just opened (OPEN): the opened state counts as saved, and the
-/// view frames the drawing with them, unless the drawing opened on the view it was saved at.
+/// Load the xrefs of drawing `i`, just opened (OPEN), then fit once to the final extents unless
+/// the drawing opened on the view it was saved at.
 pub(crate) fn after_open(s: &mut Session, i: usize) {
     let px = s.viewport_px;
     let Some(st) = s.docs.get_mut(i) else { return };
-    if !st.doc.blocks.values().any(|b| b.xref_path.is_some()) {
-        return;
+    let mut out = None;
+    if st.doc.blocks.values().any(|b| b.xref_path.is_some()) {
+        let path = st.path.clone();
+        out = Some(load::load_all(Arc::make_mut(&mut st.doc), path.as_deref()));
+        st.saved = st.doc.clone();
     }
-    let path = st.path.clone();
-    let out = load::load_all(Arc::make_mut(&mut st.doc), path.as_deref());
-    st.saved = st.doc.clone();
     let ext = st.doc.extents(&cadcraft_doc::Space::Model);
     if !ext.is_empty() && crate::view::saved_view(&st.doc).is_none() {
         // Fit in the frame of the saved twist, which open_drawing has restored.
@@ -67,7 +67,9 @@ pub(crate) fn after_open(s: &mut Session, i: usize) {
         let (center, w, h) = crate::View::twisted_box(ext, twist);
         st.set_view_quiet(crate::View { center, height: (h.max(w * px.1 / px.0.max(1.0)) * 1.1).max(1e-6), twist });
     }
-    echo_all(s, &out);
+    if let Some(out) = out {
+        echo_all(s, &out);
+    }
 }
 
 /// The file a reference saved as `path` in a drawing at `host` is read from, if there is one

@@ -241,6 +241,27 @@ fn a_drawing_with_an_xref_keeps_the_view_it_was_saved_at() {
 }
 
 #[test]
+fn file_open_fits_once_after_xref_resolution() {
+    let mut d = cadcraft_doc::Drawing::new_metric();
+    let line = cadcraft_doc::Line { a: cadcraft_geom::Vec3::ZERO, b: cadcraft_geom::Vec3::new(100.0, 60.0, 0.0) };
+    d.add(&Space::Model, cadcraft_doc::Common::default(), EntityKind::Line(line)).unwrap();
+    let mut xref = cadcraft_doc::Block::new("XR");
+    xref.xref_path = Some("missing-xref.dxf".into());
+    d.blocks.insert("XR".into(), std::sync::Arc::new(xref));
+
+    let mut expected = Session::new();
+    let expected_index = expected.open_drawing(d.clone(), "drawing.dxf", None);
+    crate::cmd::blocks::xref::after_open(&mut expected, expected_index);
+    let expected_view = expected.state().unwrap().view();
+
+    let mut opened = Session::new();
+    let index = opened.open_drawing_deferred(d, "drawing.dxf", None);
+    crate::cmd::blocks::xref::after_open(&mut opened, index);
+    assert_eq!(opened.state().unwrap().view(), expected_view);
+    assert_eq!(opened.state().unwrap().doc.extents(&Space::Model), expected.state().unwrap().doc.extents(&Space::Model));
+}
+
+#[test]
 fn move_with_pickfirst_and_window_selection() {
     let mut s = Session::new();
     s.execute("line", &json!({"points": [[0, 0], [1, 0]]})).unwrap();

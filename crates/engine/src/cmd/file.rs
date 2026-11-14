@@ -345,7 +345,7 @@ fn read_bytes(bytes: &[u8], name: &str, path: Option<String>) -> Result<ReadFile
 
 fn add_read(s: &mut Session, drawing: Drawing, binary_dxf: bool, name: &str, path: Option<String>) -> usize {
     let notes = drawing.read_notes.clone();
-    let i = s.open_drawing(drawing, &file_name(name), path);
+    let i = s.open_drawing_deferred(drawing, &file_name(name), path);
     if let Some(st) = s.docs.get_mut(i) {
         // QSAVE keeps a binary DXF binary.
         st.binary_dxf = binary_dxf;
