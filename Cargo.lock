@@ -655,6 +655,7 @@ dependencies = [
  "clap_mangen",
  "same-file",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
 ]
 
